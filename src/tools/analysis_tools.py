@@ -15,6 +15,9 @@ from agentscope import logger
 from agentscope.tool import ToolResponse
 from agentscope.message import Msg, TextBlock
 
+from models.intent_schema import IntentResult
+from models.nav_result_schema import NeedSelectionResult, RouteResult, ErrorResult
+
 
 # 全局意图识别智能体单例
 _comp_agent = None
@@ -24,6 +27,82 @@ _comp_reply_lock = asyncio.Lock()
 _nav_agent = None
 _nav_lock = asyncio.Lock()
 _nav_reply_lock = asyncio.Lock()
+
+
+def _extract_text_content_strict(content) -> str:
+    """从模型返回内容中提取纯文本，未提取到则抛错。"""
+    if isinstance(content, str):
+        text = content.strip()
+        if not text:
+            raise ValueError("模型返回空文本")
+        return text
+
+    if isinstance(content, list):
+        texts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                texts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                texts.append(block)
+        text = "\n".join(t for t in texts if isinstance(t, str)).strip()
+        if not text:
+            raise ValueError("模型返回中未包含 text block")
+        return text
+
+    raise ValueError(f"不支持的模型返回类型: {type(content)}")
+
+
+def _parse_json_dict_strict(text: str) -> dict:
+    """严格解析 JSON 字典：仅接受单个 JSON 对象。"""
+    cleaned = (text or "").strip()
+
+    # qwen3-max 偶发输出 ```json ... ``` 包裹，这里仅去掉最外层围栏。
+    if cleaned.startswith("```") and cleaned.endswith("```"):
+        lines = cleaned.splitlines()
+        if len(lines) >= 3 and lines[-1].strip() == "```":
+            head = lines[0].strip().lower()
+            if head in ("```", "```json", "```jsonc"):
+                cleaned = "\n".join(lines[1:-1]).strip()
+
+    parsed = json.loads(cleaned)
+    if not isinstance(parsed, dict):
+        raise ValueError("模型输出不是 JSON 对象")
+    return parsed
+
+
+def _validate_intent_result_strict(text: str) -> str:
+    """校验意图识别输出并返回规范化 JSON。"""
+    data = _parse_json_dict_strict(text)
+
+    # 意图模型偶发将数组槽位输出为 null，这里规范化为 [] 以匹配 schema。
+    slots = data.get("slots")
+    if isinstance(slots, dict):
+        for key in ("waypoints", "sequence"):
+            if slots.get(key) is None:
+                slots[key] = []
+
+    validated = IntentResult.model_validate(data)
+    return validated.model_dump_json(ensure_ascii=False)
+
+
+def _validate_navigation_result_strict(text: str) -> str:
+    """校验导航校验输出并返回规范化 JSON。"""
+    data = _parse_json_dict_strict(text)
+    status = data.get("status")
+
+    if status == "need_selection":
+        validated = NeedSelectionResult.model_validate(data)
+        return validated.model_dump_json(ensure_ascii=False)
+
+    if status in ("ok", "success"):
+        validated = RouteResult.model_validate(data)
+        return validated.model_dump_json(ensure_ascii=False)
+
+    if status == "error":
+        validated = ErrorResult.model_validate(data)
+        return validated.model_dump_json(ensure_ascii=False)
+
+    raise ValueError(f"未知导航结果 status: {status}")
 
 
 async def _get_comp_agent():
@@ -73,24 +152,15 @@ async def _async_trigger(user_text: str) -> str:
     )
 
     logger.info("[NAV-TRIGGER] 调用意图识别智能体...")
+    # 同一阶段串行调用，避免一个 agent 实例被并发 reply 导致上下文交错。
     async with _comp_reply_lock:
         reply = await agent.reply(user_msg)
     logger.info("[NAV-TRIGGER] 意图识别智能体回复完成")
 
-    # 提取回复内容
-    content = reply.content
-    if isinstance(content, list):
-        texts = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                texts.append(block["text"])
-            elif isinstance(block, str):
-                texts.append(block)
-        content = "\n".join(texts)
-
-    result = content if isinstance(content, str) else str(content)
-    logger.info("[NAV-TRIGGER] 分析结果: %s", result[:200])
-    return result
+    result_text = _extract_text_content_strict(reply.content)
+    normalized = _validate_intent_result_strict(result_text)
+    logger.info("[NAV-TRIGGER] 分析结果: %s", normalized[:200])
+    return normalized
 
 
 async def _async_run_navigation(navigation_request) -> str:
@@ -104,22 +174,14 @@ async def _async_run_navigation(navigation_request) -> str:
     agent = await _get_nav_agent()
     msg = Msg(name="intent_result", content=request_text, role="user")
 
+    # 导航阶段同理串行，确保 ReAct 中间思考链不被并发请求污染。
     async with _nav_reply_lock:
         reply = await agent.reply(msg)
 
-    content = reply.content
-    if isinstance(content, list):
-        texts = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                texts.append(block["text"])
-            elif isinstance(block, str):
-                texts.append(block)
-        content = "\n".join(texts)
-
-    result = content if isinstance(content, str) else str(content)
-    logger.info("[NAV-TRIGGER] 导航校验结果: %s", result[:200])
-    return result
+    result_text = _extract_text_content_strict(reply.content)
+    normalized = _validate_navigation_result_strict(result_text)
+    logger.info("[NAV-TRIGGER] 导航校验结果: %s", normalized[:200])
+    return normalized
 
 
 def trigger_navigation(user_text: str) -> ToolResponse:

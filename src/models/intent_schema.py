@@ -2,7 +2,7 @@
 """意图识别和槽位提取的数据模型（流程图版）"""
 from enum import Enum
 from typing import List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class IntentType(str, Enum):
@@ -23,6 +23,8 @@ class TravelMode(str, Enum):
 
 class NavigationSlots(BaseModel):
     """导航槽位"""
+    model_config = ConfigDict(extra="forbid")
+
     origin: Optional[str] = Field(None, description="出发地")
     destination: Optional[str] = Field(None, description="目的地")
     waypoints: List[str] = Field(default_factory=list, description="途经点列表")
@@ -41,6 +43,8 @@ class IntentResult(BaseModel):
     1. 非导航分支: is_navigation=False，仅携带 raw_text
     2. 导航分支: is_navigation=True，携带 intent_type + slots
     """
+    model_config = ConfigDict(extra="forbid")
+
     is_navigation: bool = Field(..., description="是否为导航请求")
     intent_type: Optional[IntentType] = Field(None, description="导航意图类型")
     slots: NavigationSlots = Field(

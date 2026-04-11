@@ -52,5 +52,5 @@ def create_navigation_agent() -> ReActAgent:
         model=model,
         formatter=formatter,
         toolkit=toolkit,
-        max_iters=8,
+        max_iters=4,
     )

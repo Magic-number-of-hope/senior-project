@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """高德地图 API 工具函数"""
 import json
+import time
 import urllib.parse
+from typing import Optional
 
 import aiohttp
 from agentscope import logger
@@ -11,6 +13,28 @@ from agentscope.tool import ToolResponse
 from config.settings import AMAP_API_KEY
 
 AMAP_BASE = "https://restapi.amap.com"
+_AMAP_SESSION: Optional[aiohttp.ClientSession] = None
+
+
+async def _get_amap_session() -> aiohttp.ClientSession:
+    """复用 HTTP 会话，降低 TLS/连接建立开销。"""
+    global _AMAP_SESSION
+    if _AMAP_SESSION is None or _AMAP_SESSION.closed:
+        timeout = aiohttp.ClientTimeout(total=10)
+        connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300)
+        _AMAP_SESSION = aiohttp.ClientSession(
+            timeout=timeout,
+            connector=connector,
+        )
+    return _AMAP_SESSION
+
+
+async def close_amap_session() -> None:
+    """关闭复用会话，供应用 shutdown 时调用。"""
+    global _AMAP_SESSION
+    if _AMAP_SESSION is not None and not _AMAP_SESSION.closed:
+        await _AMAP_SESSION.close()
+    _AMAP_SESSION = None
 
 
 async def _amap_get(path: str, params: dict) -> dict:
@@ -18,9 +42,12 @@ async def _amap_get(path: str, params: dict) -> dict:
     params["key"] = AMAP_API_KEY
     url = f"{AMAP_BASE}{path}?{urllib.parse.urlencode(params)}"
     logger.info("[AMAP] GET %s", url.replace(AMAP_API_KEY, "***"))
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            data = await resp.json(content_type=None)
+    t0 = time.perf_counter()
+    session = await _get_amap_session()
+    async with session.get(url) as resp:
+        data = await resp.json(content_type=None)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    logger.info("[AMAP] DONE path=%s elapsed=%.1fms", path, elapsed_ms)
     if data.get("status") == "0":
         logger.error("[AMAP] API错误: %s (infocode=%s) path=%s",
                      data.get("info", ""), data.get("infocode", ""), path)
@@ -157,7 +184,8 @@ async def geocode(address: str, city: str = "") -> ToolResponse:
     Returns:
         地理编码结果
     """
-    # 先用 POI 搜索（更灵活，支持模糊地名）
+    # 先用 POI 搜索（更灵活，支持模糊地名）。
+    # 这里优先返回 need_selection，而不是强行选第一个，避免“同名地点误导航”。
     poi_params = {"keywords": address}
     if city:
         poi_params["region"] = city
@@ -188,7 +216,7 @@ async def geocode(address: str, city: str = "") -> ToolResponse:
             "cityname": poi.get("cityname", ""),
         }, ensure_ascii=False))
 
-    # 降级到 geocode v3
+    # 如果 POI 完全查不到，再降级到 geocode v3（偏地址解析，不擅长模糊场景）。
     geo_params = {"address": address}
     if city:
         geo_params["city"] = city
@@ -241,13 +269,14 @@ async def reverse_geocode(location: str) -> ToolResponse:
 
 # ────────────────── 路线规划 ──────────────────
 
-async def route_planning(
+async def  route_planning(
     origin: str,
     destination: str,
     mode: str = "driving",
     waypoints: str = "",
     strategy: str = "",
     city: str = "",
+    include_polyline: bool = False,
 ) -> ToolResponse:
     """规划从起点到终点的路线。
 
@@ -269,8 +298,11 @@ async def route_planning(
         "bicycling": "/v5/direction/bicycling",
     }
     path = mode_paths.get(mode, "/v5/direction/driving")
-    params = {"origin": origin, "destination": destination,
-              "show_fields": "cost,polyline"}
+    params = {
+        "origin": origin,
+        "destination": destination,
+        "show_fields": "cost,polyline" if include_polyline else "cost",
+    }
     if waypoints:
         params["waypoints"] = waypoints
     if strategy and mode == "driving":
@@ -278,6 +310,7 @@ async def route_planning(
     if mode == "transit":
         # 公交模式必须传城市 adcode 参数
         # 从起点坐标自动反查 adcode（取前4位得到市级编码）
+        # 这么做是为了减少上游传 city 的要求，优先让工具层自洽。
         regeo = await _amap_get("/v3/geocode/regeo", {
             "location": origin, "output": "JSON",
         })

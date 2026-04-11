@@ -10,6 +10,9 @@ AMAP_WEB_SECRET = os.getenv("AMAP_WEB_SECRET", "")     # Web 端 JS API 安全�
 
 # ── 模型名称 ──
 CHAT_MODEL_NAME = os.getenv("CHAT_MODEL_NAME", "qwen-max")
+COMPREHENSION_MODEL_NAME = os.getenv(
+    "COMPREHENSION_MODEL_NAME", "qwen3-max",
+)
 REALTIME_MODEL_NAME = os.getenv(
     "REALTIME_MODEL_NAME", "qwen3-omni-flash-realtime",
 )
