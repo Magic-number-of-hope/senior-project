@@ -7,6 +7,7 @@ DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 AMAP_API_KEY = os.getenv("AMAP_API_KEY", "")           # 服务端 REST API
 AMAP_WEB_KEY = os.getenv("AMAP_WEB_KEY", "")           # Web 端 JS API Key
 AMAP_WEB_SECRET = os.getenv("AMAP_WEB_SECRET", "")     # Web 端 JS API 安全密钥
+AMAP_WEB_SERVICE_HOST = os.getenv("AMAP_WEB_SERVICE_HOST", "")  # JS API 代理 serviceHost
 
 # ── 模型名称 ──
 CHAT_MODEL_NAME = os.getenv("CHAT_MODEL_NAME", "qwen-max")

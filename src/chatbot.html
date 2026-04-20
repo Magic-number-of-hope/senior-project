@@ -677,6 +677,41 @@
             background: #f1f8e9;
         }
 
+        .route-options {
+            display: none;
+            margin: 0.35rem 0 0.75rem;
+            padding: 0.5rem;
+            border: 1px solid hsl(214.3, 31.8%, 91.4%);
+            border-radius: 0.5rem;
+            background: #fff;
+        }
+        .route-options-title {
+            font-size: 0.8rem;
+            color: #1f3340;
+            font-weight: 600;
+            margin-bottom: 0.45rem;
+        }
+        .route-option-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.4rem;
+        }
+        .route-option-chip {
+            border: 1px solid #b9cad5;
+            border-radius: 999px;
+            background: #f6fafc;
+            color: #173849;
+            font-size: 0.78rem;
+            padding: 0.3rem 0.7rem;
+            cursor: pointer;
+        }
+        .route-option-chip.active {
+            border-color: #0f766e;
+            background: #e8f8f4;
+            color: #0b4b45;
+            font-weight: 600;
+        }
+
         @media (max-width: 760px) {
             body {
                 padding: 1rem;
@@ -836,6 +871,7 @@
     <div id="mapContainer" style="width:100%;height:420px;border-radius:0.5rem;border:1px solid hsl(214.3,31.8%,91.4%);display:none;margin:0.75rem 0;position:relative;">
         <div id="mapInner" style="width:100%;height:100%;"></div>
     </div>
+    <div id="routeOptions" class="route-options"></div>
 
     <!-- 意图/槽位分析面板 -->
     <div id="intentPanel" style="display:none;"></div>
@@ -1363,30 +1399,28 @@
             // 优先使用高德定位（GCJ-02），与后端高德检索坐标系一致。
             if (amapReady && window.AMap) {
                 try {
-                    AMap.plugin("AMap.Geolocation", function() {
-                        const geolocation = new AMap.Geolocation({
-                            enableHighAccuracy: true,
-                            timeout: 8000,
-                            convert: true,
-                            showButton: false,
-                        });
-                        geolocation.getCurrentPosition(function(status, result) {
-                            if (status === "complete" && result && result.position) {
-                                const lng = Number(result.position.lng).toFixed(6);
-                                const lat = Number(result.position.lat).toFixed(6);
-                                const payload = {
-                                    location: `${lng},${lat}`,
-                                    name: "当前位置",
-                                    source: "amap",
-                                    accuracy: Math.round(result.accuracy || 0),
-                                    timestamp: Date.now(),
-                                };
-                                sendLocationUpdate(payload, !!force);
-                                console.log("[LOCATION] uploaded(amap)", payload.location);
-                                return;
-                            }
-                            uploadBrowserLocation(force);
-                        });
+                    const geolocation = new AMap.Geolocation({
+                        enableHighAccuracy: true,
+                        timeout: 8000,
+                        convert: true,
+                        showButton: false,
+                    });
+                    geolocation.getCurrentPosition(function(status, result) {
+                        if (status === "complete" && result && result.position) {
+                            const lng = Number(result.position.lng).toFixed(6);
+                            const lat = Number(result.position.lat).toFixed(6);
+                            const payload = {
+                                location: `${lng},${lat}`,
+                                name: "当前位置",
+                                source: "amap",
+                                accuracy: Math.round(result.accuracy || 0),
+                                timestamp: Date.now(),
+                            };
+                            sendLocationUpdate(payload, !!force);
+                            console.log("[LOCATION] uploaded(amap)", payload.location);
+                            return;
+                        }
+                        uploadBrowserLocation(force);
                     });
                     return;
                 } catch (err) {
@@ -1545,8 +1579,10 @@
                             break;
 
                         case "nav_route_result":
-                            renderRouteResult(data.route_result);
-                            showRouteOnMap(data.route_result);
+                            var jsPlannedRoute = await planRouteByJsApiOnce(data.route_result || {});
+                            renderRouteResult(jsPlannedRoute);
+                            await showRouteOnMap(jsPlannedRoute);
+                            sendPlannedRouteToBackend(jsPlannedRoute);
                             updateNavStatus("done", "路线规划完成");
                             break;
 
@@ -2241,13 +2277,29 @@
         function renderRouteResult(route) {
             if (!route) return;
 
+            var routeOptions = getRouteOptions(route);
+            var selectedIdx = Number(selectedRouteIndex) || 0;
+            if (selectedIdx < 0 || selectedIdx >= routeOptions.length) {
+                selectedIdx = 0;
+            }
+            var activeOption = routeOptions[selectedIdx] || routeOptions[0] || {};
+            var displaySteps = Array.isArray(activeOption.steps) && activeOption.steps.length > 0
+                ? activeOption.steps
+                : (Array.isArray(route.steps) ? route.steps : []);
+            var displayDistance = activeOption.distance || route.distance || "";
+            var displayDuration = activeOption.duration || route.duration || "";
+            var displayTaxiCost = activeOption.taxi_cost || route.taxi_cost || "";
+
             const routeKey = [
                 route.origin_name || "",
                 route.destination_name || "",
-                route.distance || "",
-                route.duration || "",
-                route.taxi_cost || "",
-                Array.isArray(route.steps) ? route.steps.length : 0,
+                displayDistance || "",
+                displayDuration || "",
+                displayTaxiCost || "",
+                Array.isArray(displaySteps) ? displaySteps.length : 0,
+                routeOptions.length,
+                selectedIdx,
+                route.polyline ? route.polyline.length : 0,
             ].join("|");
 
             // 后端可能先返回首屏结果，再回填 polyline 二次推送；同一路线仅渲染一次。
@@ -2268,21 +2320,27 @@
             if (route.origin_name && route.destination_name) {
                 html += '<p><strong>' + route.origin_name + '</strong> → <strong>' + route.destination_name + '</strong></p>';
             }
-            if (route.distance) {
-                const km = (parseFloat(route.distance) / 1000).toFixed(1);
+            if (Array.isArray(route.waypoints) && route.waypoints.length > 0) {
+                html += '<p>途经点: ' + route.waypoints.join(' → ') + '</p>';
+            }
+            if (displayDistance) {
+                const km = (parseFloat(displayDistance) / 1000).toFixed(1);
                 html += '<p>距离: ' + km + ' 公里';
-                if (route.duration) {
-                    const min = Math.round(parseFloat(route.duration) / 60);
+                if (displayDuration) {
+                    const min = Math.round(parseFloat(displayDuration) / 60);
                     html += ' | 预计: ' + min + ' 分钟';
                 }
                 html += '</p>';
             }
-            if (route.taxi_cost) {
-                html += '<p>预计打车费: ¥' + route.taxi_cost + '</p>';
+            if (displayTaxiCost) {
+                html += '<p>预计打车费: ¥' + displayTaxiCost + '</p>';
             }
-            if (route.steps && route.steps.length > 0) {
-                html += '<details><summary>详细路线 (' + route.steps.length + ' 步)</summary><ol style="font-size:0.78rem;padding-left:1.2rem;">';
-                route.steps.forEach(function(s) {
+            if (routeOptions.length > 1) {
+                html += '<p>可选路线: ' + routeOptions.length + ' 条（可在地图下方切换）</p>';
+            }
+            if (displaySteps && displaySteps.length > 0) {
+                html += '<details><summary>详细路线 (' + displaySteps.length + ' 步)</summary><ol style="font-size:0.78rem;padding-left:1.2rem;">';
+                displaySteps.forEach(function(s) {
                     html += '<li>' + (s.instruction || s) + '</li>';
                 });
                 html += '</ol></details>';
@@ -2294,8 +2352,8 @@
             lastRouteRenderKey = routeKey;
 
             // Summary message
-            const km = route.distance ? (parseFloat(route.distance) / 1000).toFixed(1) + "km" : "";
-            const min = route.duration ? Math.round(parseFloat(route.duration) / 60) + "min" : "";
+            const km = displayDistance ? (parseFloat(displayDistance) / 1000).toFixed(1) + "km" : "";
+            const min = displayDuration ? Math.round(parseFloat(displayDuration) / 60) + "min" : "";
             addMessage("System", "🗺️ 路线: " + (route.origin_name||"") + " → " + (route.destination_name||"") + " " + km + " " + min);
         }
 
@@ -2519,7 +2577,18 @@
         var amapInstance = null;
         var amapReady = false;
         var amapMarkers = [];
-        var amapPolyline = null;
+        var amapPolylines = [];
+        var selectedRouteIndex = 0;
+        var latestRoutePayload = null;
+        var amapRouteServices = {
+            driving: null,
+            walking: null,
+            riding: null,
+            transit: null,
+        };
+        var amapRouteDynamicServices = [];
+        var amapRouteServicesPromise = null;
+        var amapLoaderPromise = null;
 
         async function initAMap() {
             try {
@@ -2527,23 +2596,56 @@
                 var json = await resp.json();
                 var amapKey = json.key;
                 var amapSecret = json.secret;
+                var amapServiceHost = json.service_host;
                 if (!amapKey) {
                     console.warn("[MAP] No AMAP_WEB_KEY, map disabled");
                     return;
                 }
-                // 动态加载高德 JS API 2.0
-                await new Promise(function(resolve, reject) {
-                    if (window.AMap) { resolve(); return; }
-                    // 设置安全密钥（JS API 2.0 必须）
-                    window._AMapSecurityConfig = {
-                        securityJsCode: amapSecret || "",
-                    };
-                    var s = document.createElement("script");
-                    s.src = "https://webapi.amap.com/maps?v=2.0&key=" + amapKey;
-                    s.onload = resolve;
-                    s.onerror = reject;
-                    document.head.appendChild(s);
+
+                // 文档要求：必须在 AMapLoader.load 前配置安全策略。
+                if (amapServiceHost) {
+                    window._AMapSecurityConfig = { serviceHost: amapServiceHost };
+                } else {
+                    window._AMapSecurityConfig = { securityJsCode: amapSecret || "" };
+                }
+
+                // 先加载 loader.js，再调用 AMapLoader.load。
+                if (!amapLoaderPromise) {
+                    amapLoaderPromise = new Promise(function(resolve, reject) {
+                        if (window.AMapLoader && typeof window.AMapLoader.load === "function") {
+                            resolve(window.AMapLoader);
+                            return;
+                        }
+                        var s = document.createElement("script");
+                        s.src = "https://webapi.amap.com/loader.js";
+                        s.onload = function() {
+                            if (window.AMapLoader && typeof window.AMapLoader.load === "function") {
+                                resolve(window.AMapLoader);
+                                return;
+                            }
+                            reject(new Error("AMapLoader not available"));
+                        };
+                        s.onerror = reject;
+                        document.head.appendChild(s);
+                    });
+                }
+
+                var AMapLoader = await amapLoaderPromise;
+                await AMapLoader.load({
+                    key: amapKey,
+                    version: "2.0",
+                    plugins: [
+                        "AMap.Scale",
+                        "AMap.ToolBar",
+                        "AMap.ControlBar",
+                        "AMap.Geolocation",
+                        "AMap.Driving",
+                        "AMap.Walking",
+                        "AMap.Riding",
+                        "AMap.Transfer",
+                    ],
                 });
+
                 amapReady = true;
                 console.log("[MAP] AMap JS API loaded");
             } catch (e) {
@@ -2560,92 +2662,970 @@
                     zoom: 13,
                     center: [114.35, 30.52],  // 武汉默认中心
                     resizeEnable: true,
-                    viewMode: "2D",
+                    viewMode: "3D",
                 });
+                amapInstance.on("complete", function() {
+                    console.log("[MAP] map complete");
+                });
+                amapInstance.addControl(new AMap.Scale());
+                amapInstance.addControl(new AMap.ToolBar({ position: "RT" }));
+                if (AMap.ControlBar) {
+                    amapInstance.addControl(new AMap.ControlBar({
+                        position: { right: "10px", top: "70px" },
+                    }));
+                }
             }
             return amapInstance;
         }
 
         function clearMapOverlays() {
             if (!amapInstance) return;
-            amapMarkers.forEach(function(m) { amapInstance.remove(m); });
+            clearRouteServices();
+            amapMarkers.forEach(function(m) { m.setMap(null); });
             amapMarkers = [];
-            if (amapPolyline) {
-                amapInstance.remove(amapPolyline);
-                amapPolyline = null;
+            amapPolylines.forEach(function(pl) { pl.setMap(null); });
+            amapPolylines = [];
+        }
+
+        function clearRouteServices() {
+            ["driving", "walking", "riding", "transit"].forEach(function(mode) {
+                var planner = amapRouteServices[mode];
+                if (planner && typeof planner.clear === "function") {
+                    try {
+                        planner.clear();
+                    } catch (e) {
+                        console.warn("[MAP] clear route service failed:", mode, e);
+                    }
+                }
+            });
+
+            amapRouteDynamicServices.forEach(function(planner) {
+                if (!planner) return;
+                try {
+                    if (typeof planner.clear === "function") {
+                        planner.clear();
+                    }
+                    if (typeof planner.setMap === "function") {
+                        planner.setMap(null);
+                    }
+                } catch (e) {
+                    console.warn("[MAP] clear dynamic route service failed:", e);
+                }
+            });
+            amapRouteDynamicServices = [];
+        }
+
+        async function ensureRouteServices() {
+            var map = ensureMap();
+            if (!map || !window.AMap) return false;
+
+            if (amapRouteServices.driving && amapRouteServices.walking && amapRouteServices.riding && amapRouteServices.transit) {
+                return true;
             }
+
+            if (!amapRouteServicesPromise) {
+                amapRouteServicesPromise = new Promise(function(resolve, reject) {
+                    try {
+                        amapRouteServices.driving = new AMap.Driving({
+                            map: map,
+                            hideMarkers: true,
+                            showTraffic: true,
+                            autoFitView: true,
+                            policy: (window.AMap && AMap.DrivingPolicy)
+                                ? AMap.DrivingPolicy.LEAST_TIME
+                                : undefined,
+                        });
+                        amapRouteServices.walking = new AMap.Walking({
+                            map: map,
+                            hideMarkers: true,
+                            autoFitView: true,
+                        });
+                        amapRouteServices.riding = new AMap.Riding({
+                            map: map,
+                            autoFitView: true,
+                        });
+                        amapRouteServices.transit = new AMap.Transfer({
+                            map: map,
+                            city: "武汉",
+                            policy: (window.AMap && AMap.TransferPolicy)
+                                ? AMap.TransferPolicy.LEAST_TIME
+                                : undefined,
+                        });
+                        resolve(true);
+                    } catch (err) {
+                        reject(err);
+                    }
+                }).catch(function(err) {
+                    console.warn("[MAP] route services init failed:", err);
+                    amapRouteServicesPromise = null;
+                    return false;
+                });
+            }
+
+            return await amapRouteServicesPromise;
+        }
+
+        function toAmapLngLat(point) {
+            var p = parseLngLat(point);
+            if (!p) return null;
+            return new AMap.LngLat(p[0], p[1]);
+        }
+
+        function lngLatObjToPairString(point) {
+            if (!point) return "";
+            var lng = typeof point.getLng === "function" ? point.getLng() : point.lng;
+            var lat = typeof point.getLat === "function" ? point.getLat() : point.lat;
+            if (lng == null || lat == null) return "";
+            return Number(lng).toFixed(6) + "," + Number(lat).toFixed(6);
+        }
+
+        function stepToPolyline(step) {
+            if (!step) return "";
+            if (Array.isArray(step.path) && step.path.length > 0) {
+                var pointPairs = step.path
+                    .map(lngLatObjToPairString)
+                    .filter(function(s) { return !!s; });
+                return pointPairs.join(";");
+            }
+            if (typeof step.polyline === "string" && step.polyline) {
+                return step.polyline;
+            }
+            return "";
+        }
+
+        function normalizeJsApiRouteResult(mode, result, baseRoute) {
+            var routesRaw = Array.isArray(result && result.routes) ? result.routes : [];
+            if (!routesRaw.length) return null;
+
+            var routeMode = mode === "bicycling" ? "bicycling" : mode;
+            var options = routesRaw.map(function(r, idx) {
+                var stepsRaw = Array.isArray(r.steps) ? r.steps : [];
+                var stepList = stepsRaw.map(function(s) {
+                    return {
+                        instruction: s.instruction || s.action || "",
+                        distance: String(s.distance != null ? s.distance : ""),
+                    };
+                });
+
+                var polylineSegments = stepsRaw
+                    .map(stepToPolyline)
+                    .filter(function(s) { return !!s; });
+                var routePolyline = polylineSegments.join("|");
+
+                var duration = r.time != null ? r.time : r.duration;
+                return {
+                    route_index: idx,
+                    summary: routeMode + "方案" + (idx + 1),
+                    distance: String(r.distance != null ? r.distance : ""),
+                    duration: String(duration != null ? duration : ""),
+                    taxi_cost: String(result && result.taxi_cost != null ? result.taxi_cost : (baseRoute && baseRoute.taxi_cost) || ""),
+                    steps: stepList,
+                    polyline: routePolyline,
+                    segments: routePolyline
+                        ? [{
+                            type: routeMode,
+                            line_name: routeMode,
+                            polyline: routePolyline,
+                        }]
+                        : [],
+                };
+            });
+
+            if (!options.length) return null;
+            var best = options[0];
+
+            return Object.assign({}, baseRoute || {}, {
+                status: "success",
+                mode: routeMode,
+                route_mode: routeMode,
+                route_count: options.length,
+                routes: options,
+                distance: best.distance,
+                duration: best.duration,
+                taxi_cost: best.taxi_cost,
+                steps: best.steps,
+                polyline: best.polyline,
+                segments: best.segments,
+                _skip_service_search: true,
+                _service_already_tried: true,
+            });
+        }
+
+        async function planRouteByJsApiOnce(route) {
+            var baseRoute = route || {};
+            var mode = String((baseRoute.route_mode || baseRoute.mode || baseRoute.travel_mode || "driving")).toLowerCase();
+
+            // 仅使用一次 JS API 导航请求，若失败则回退已有结果但不再二次请求。
+            var out = Object.assign({}, baseRoute, {
+                _service_already_tried: true,
+            });
+
+            if (!["driving", "walking", "bicycling"].includes(mode)) {
+                // transit 由 showRouteOnMap 中的官方 Transfer 服务进行单次请求与绘制。
+                return Object.assign({}, baseRoute, {
+                    _service_already_tried: false,
+                });
+            }
+
+            var ready = await ensureRouteServices();
+            if (!ready) return out;
+
+            var origin = toAmapLngLat(baseRoute.origin_location);
+            var destination = toAmapLngLat(baseRoute.destination_location);
+            if (!origin || !destination) return out;
+
+            var result = await new Promise(function(resolve) {
+                try {
+                    if (mode === "driving") {
+                        var wps = (Array.isArray(baseRoute.waypoint_locations) ? baseRoute.waypoint_locations : [])
+                            .map(function(loc) { return toAmapLngLat(loc); })
+                            .filter(function(p) { return !!p; });
+                        if (wps.length > 0) {
+                            amapRouteServices.driving.search(origin, destination, { waypoints: wps }, function(status, r) {
+                                resolve(status === "complete" ? r : null);
+                            });
+                        } else {
+                            amapRouteServices.driving.search(origin, destination, function(status, r) {
+                                resolve(status === "complete" ? r : null);
+                            });
+                        }
+                        return;
+                    }
+
+                    if (mode === "walking") {
+                        amapRouteServices.walking.search(origin, destination, function(status, r) {
+                            resolve(status === "complete" ? r : null);
+                        });
+                        return;
+                    }
+
+                    if (mode === "bicycling") {
+                        amapRouteServices.riding.search(origin, destination, function(status, r) {
+                            resolve(status === "complete" ? r : null);
+                        });
+                        return;
+                    }
+
+                    resolve(null);
+                } catch (err) {
+                    console.warn("[MAP] JS API route planning failed:", err);
+                    resolve(null);
+                }
+            });
+
+            var normalized = normalizeJsApiRouteResult(mode, result, baseRoute);
+            return normalized || out;
+        }
+
+        function doDrivingSearchWithWaypoints(driving, origin, destination, waypointPoints) {
+            return new Promise(function(resolve) {
+                var wps = Array.isArray(waypointPoints) ? waypointPoints : [];
+
+                // 官方方式：search(start, end, { waypoints }, callback)
+                try {
+                    if (wps.length > 0) {
+                        driving.search(origin, destination, { waypoints: wps }, function(status) {
+                            resolve(status === "complete");
+                        });
+                    } else {
+                        driving.search(origin, destination, function(status) {
+                            resolve(status === "complete");
+                        });
+                    }
+                    return;
+                } catch (e) {
+                    // 回退：部分版本可能不支持 options 参数，尝试旧式多点调用。
+                }
+
+                var points = [origin].concat(wps).concat([destination]);
+                try {
+                    driving.search(points, function(status) {
+                        resolve(status === "complete");
+                    });
+                    return;
+                } catch (e2) {
+                    // ignore
+                }
+
+                try {
+                    driving.search(origin, destination, function(status) {
+                        resolve(status === "complete");
+                    });
+                } catch (err) {
+                    console.warn("[MAP] driving.search failed:", err);
+                    resolve(false);
+                }
+            });
+        }
+
+        function buildSearchCheckpoints(route) {
+            var points = [];
+            var origin = toAmapLngLat(route && route.origin_location);
+            if (origin) points.push(origin);
+
+            var waypointLocs = Array.isArray(route && route.waypoint_locations)
+                ? route.waypoint_locations
+                : [];
+            waypointLocs.forEach(function(loc) {
+                var wp = toAmapLngLat(loc);
+                if (wp) points.push(wp);
+            });
+
+            var destination = toAmapLngLat(route && route.destination_location);
+            if (destination) points.push(destination);
+            return points;
+        }
+
+        function inferTransitCity(route) {
+            var candidates = [
+                route && route.city,
+                route && route.cityname,
+                route && route.city1,
+                route && route.origin_city,
+                route && route.destination_city,
+            ];
+            for (var i = 0; i < candidates.length; i++) {
+                var c = (candidates[i] || "").trim();
+                if (c) return c;
+            }
+            return "武汉";
+        }
+
+        function createRoutePlanner(mode, city) {
+            var map = ensureMap();
+            if (!map || !window.AMap) return null;
+
+            if (mode === "walking") {
+                return new AMap.Walking({
+                    map: map,
+                    hideMarkers: true,
+                    autoFitView: false,
+                });
+            }
+            if (mode === "riding") {
+                return new AMap.Riding({
+                    map: map,
+                    autoFitView: false,
+                });
+            }
+            if (mode === "transit") {
+                return new AMap.Transfer({
+                    map: map,
+                    city: city || "武汉",
+                    policy: (window.AMap && AMap.TransferPolicy)
+                        ? AMap.TransferPolicy.LEAST_TIME
+                        : undefined,
+                });
+            }
+            return null;
+        }
+
+        function runPlannerSearch(planner, mode, fromPoint, toPoint) {
+            return new Promise(function(resolve) {
+                try {
+                    planner.search(fromPoint, toPoint, function(status) {
+                        resolve(status === "complete");
+                    });
+                } catch (err) {
+                    console.warn("[MAP] " + mode + ".search failed:", err);
+                    resolve(false);
+                }
+            });
+        }
+
+        async function drawByOfficialLegs(mode, checkpoints, city) {
+            if (!Array.isArray(checkpoints) || checkpoints.length < 2) return false;
+
+            var allSuccess = true;
+            for (var i = 0; i < checkpoints.length - 1; i++) {
+                var planner = createRoutePlanner(mode, city);
+                if (!planner) return false;
+                amapRouteDynamicServices.push(planner);
+
+                var ok = await runPlannerSearch(
+                    planner,
+                    mode,
+                    checkpoints[i],
+                    checkpoints[i + 1],
+                );
+                if (!ok) {
+                    allSuccess = false;
+                    break;
+                }
+            }
+            return allSuccess;
+        }
+
+        async function drawRouteByAmapNavigationService(route) {
+            var mode = String((route && (route.route_mode || route.mode)) || "driving").toLowerCase();
+            if (!["driving", "walking", "bicycling", "transit"].includes(mode)) {
+                return false;
+            }
+
+            var ready = await ensureRouteServices();
+            if (!ready) return false;
+
+            var origin = toAmapLngLat(route && route.origin_location);
+            var destination = toAmapLngLat(route && route.destination_location);
+            if (!origin || !destination) return false;
+
+            clearRouteServices();
+
+            var checkpoints = buildSearchCheckpoints(route);
+
+            if (mode === "driving") {
+                var wpLocs = Array.isArray(route && route.waypoint_locations)
+                    ? route.waypoint_locations
+                    : [];
+                var waypointPoints = wpLocs
+                    .map(function(loc) { return toAmapLngLat(loc); })
+                    .filter(function(p) { return !!p; });
+                return await doDrivingSearchWithWaypoints(
+                    amapRouteServices.driving,
+                    origin,
+                    destination,
+                    waypointPoints,
+                );
+            }
+
+            if (mode === "walking") {
+                return await drawByOfficialLegs("walking", checkpoints, "");
+            }
+
+            if (mode === "bicycling") {
+                return await drawByOfficialLegs("riding", checkpoints, "");
+            }
+
+            if (mode === "transit") {
+                var transitCity = inferTransitCity(route);
+                return await drawByOfficialLegs("transit", checkpoints, transitCity);
+            }
+
+            return false;
         }
 
         function parseLngLat(locStr) {
-            // "114.317603,30.528545" → [114.317603, 30.528545]
+            // 支持 "lng,lat" / [lng, lat] / {lng,lat}
             if (!locStr) return null;
+            if (Array.isArray(locStr) && locStr.length >= 2) {
+                var aLng = parseFloat(locStr[0]);
+                var aLat = parseFloat(locStr[1]);
+                if (!isNaN(aLng) && !isNaN(aLat)) return [aLng, aLat];
+            }
+            if (typeof locStr === "object" && locStr.lng != null && locStr.lat != null) {
+                var oLng = parseFloat(locStr.lng);
+                var oLat = parseFloat(locStr.lat);
+                if (!isNaN(oLng) && !isNaN(oLat)) return [oLng, oLat];
+            }
+            if (typeof locStr !== "string") return null;
+
             var parts = locStr.split(",");
             if (parts.length < 2) return null;
-            return [parseFloat(parts[0]), parseFloat(parts[1])];
+            var lng = parseFloat(parts[0]);
+            var lat = parseFloat(parts[1]);
+            if (isNaN(lng) || isNaN(lat)) return null;
+            return [lng, lat];
         }
 
-        function showRouteOnMap(route) {
+        function parsePolylineToPaths(polylineStr) {
+            // 高德路径坐标串标准：x1,y1;x2,y2|x3,y3;x4,y4
+            // 其中 | 为多段分隔，; 为点分隔。
+            if (!polylineStr || typeof polylineStr !== "string") return [];
+
+            var segments = polylineStr.split("|");
+            var paths = [];
+
+            segments.forEach(function(segStr) {
+                var seg = (segStr || "").trim();
+                if (!seg) return;
+
+                var points = seg.split(";");
+                var path = [];
+
+                points.forEach(function(pointStr) {
+                    var p = parseLngLat(pointStr.trim());
+                    if (p) {
+                        path.push(new AMap.LngLat(p[0], p[1]));
+                    }
+                });
+
+                if (path.length >= 2) {
+                    paths.push(path);
+                }
+            });
+
+            return paths;
+        }
+
+        function normalizeRouteOption(route, option, idx) {
+            var opt = option || {};
+            return {
+                route_index: opt.route_index != null ? opt.route_index : idx,
+                summary: opt.summary || ((MODE_LABELS[route.route_mode || route.mode] || "路线") + "方案" + (idx + 1)),
+                distance: opt.distance || route.distance || "",
+                duration: opt.duration || route.duration || "",
+                taxi_cost: opt.taxi_cost || route.taxi_cost || "",
+                transfer_count: opt.transfer_count,
+                steps: Array.isArray(opt.steps) ? opt.steps : (Array.isArray(route.steps) ? route.steps : []),
+                polyline: opt.polyline || "",
+                segments: Array.isArray(opt.segments) ? opt.segments : [],
+            };
+        }
+
+        function getOptionPolyline(option, route) {
+            if (option && option.polyline) return option.polyline;
+            if (route && route.polyline) return route.polyline;
+            return "";
+        }
+
+        function getRouteOptions(route) {
+            if (!route) return [];
+            if (Array.isArray(route.routes) && route.routes.length > 0) {
+                return route.routes.map(function(opt, idx) {
+                    return normalizeRouteOption(route, opt, idx);
+                });
+            }
+
+            return [normalizeRouteOption(route, {
+                route_index: 0,
+                summary: "推荐路线",
+                distance: route.distance || "",
+                duration: route.duration || "",
+                taxi_cost: route.taxi_cost || "",
+                steps: Array.isArray(route.steps) ? route.steps : [],
+                polyline: route.polyline || "",
+                segments: Array.isArray(route.segments) ? route.segments : [],
+            }, 0)];
+        }
+
+        function buildSelectedRoutePayload(route) {
+            var base = route || {};
+            var options = getRouteOptions(base);
+            var idx = Number(selectedRouteIndex) || 0;
+            if (idx < 0 || idx >= options.length) idx = 0;
+            var active = options[idx] || {};
+
+            var mergedSteps = Array.isArray(active.steps) && active.steps.length > 0
+                ? active.steps
+                : (Array.isArray(base.steps) ? base.steps : []);
+
+            return {
+                status: base.status || "success",
+                origin_name: base.origin_name || "",
+                destination_name: base.destination_name || "",
+                origin_location: base.origin_location || "",
+                destination_location: base.destination_location || "",
+                route_mode: base.route_mode || base.mode || "driving",
+                waypoints: Array.isArray(base.waypoints) ? base.waypoints : [],
+                waypoint_locations: Array.isArray(base.waypoint_locations) ? base.waypoint_locations : [],
+                distance: active.distance || base.distance || "",
+                duration: active.duration || base.duration || "",
+                taxi_cost: active.taxi_cost || base.taxi_cost || "",
+                steps: mergedSteps,
+                route_index: active.route_index != null ? active.route_index : idx,
+            };
+        }
+
+        function sendPlannedRouteToBackend(route) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            var payload = buildSelectedRoutePayload(route);
+            ws.send(JSON.stringify({
+                type: "nav_js_route_result",
+                route_result: payload,
+            }));
+        }
+
+        function formatDurationMinutes(duration) {
+            var mins = Math.round(parseFloat(duration || 0) / 60);
+            return isNaN(mins) || mins <= 0 ? "" : (mins + "分钟");
+        }
+
+        function formatDistanceKm(distance) {
+            var km = (parseFloat(distance || 0) / 1000).toFixed(1);
+            return isNaN(parseFloat(km)) || parseFloat(km) <= 0 ? "" : (km + "公里");
+        }
+
+        function renderRouteSelector(route) {
+            var optionsBox = document.getElementById("routeOptions");
+            if (!optionsBox) return;
+
+            var options = getRouteOptions(route);
+            if (options.length <= 1) {
+                optionsBox.style.display = "none";
+                optionsBox.innerHTML = "";
+                selectedRouteIndex = 0;
+                return;
+            }
+
+            if (selectedRouteIndex >= options.length) {
+                selectedRouteIndex = 0;
+            }
+
+            var modeLabel = MODE_LABELS[route.route_mode || route.mode] || "路线";
+            var html = '<div class="route-options-title">可选' + modeLabel + '方案（共' + options.length + '条）</div>';
+            html += '<div class="route-option-list">';
+
+            options.forEach(function(opt, idx) {
+                var title = opt.summary || (modeLabel + "方案" + (idx + 1));
+                var d = formatDistanceKm(opt.distance);
+                var t = formatDurationMinutes(opt.duration);
+                var extra = [];
+                if (d) extra.push(d);
+                if (t) extra.push(t);
+                if (opt.transfer_count != null && String(opt.transfer_count) !== "") {
+                    extra.push("换乘" + opt.transfer_count + "次");
+                }
+                var cls = idx === selectedRouteIndex ? "route-option-chip active" : "route-option-chip";
+                html += '<button class="' + cls + '" data-route-idx="' + idx + '">' + title;
+                if (extra.length > 0) {
+                    html += ' · ' + extra.join(' / ');
+                }
+                html += '</button>';
+            });
+
+            html += '</div>';
+            optionsBox.innerHTML = html;
+            optionsBox.style.display = "block";
+
+            optionsBox.querySelectorAll("[data-route-idx]").forEach(function(btn) {
+                btn.addEventListener("click", function() {
+                    var idx = parseInt(this.getAttribute("data-route-idx"), 10);
+                    if (isNaN(idx)) return;
+                    selectedRouteIndex = idx;
+                    renderRouteSelector(route);
+                    renderRouteResult(route);
+                    showRouteOnMap(route);
+                    sendPlannedRouteToBackend(route);
+                });
+            });
+        }
+
+        function drawPolylinePath(path, style) {
+            if (!path || path.length < 2) return null;
+            var pl = new AMap.Polyline({
+                path: path,
+                zIndex: style && style.zIndex != null ? style.zIndex : 80,
+                strokeColor: style && style.color ? style.color : "#2563eb",
+                strokeWeight: style && style.weight != null ? style.weight : 6,
+                strokeOpacity: style && style.opacity != null ? style.opacity : 0.9,
+                strokeStyle: style && style.dashed ? "dashed" : "solid",
+                strokeDasharray: style && style.dashed ? [10, 8] : [0, 0],
+                showDir: !!(style && style.showDir),
+                isOutline: !!(style && style.isOutline),
+                outlineColor: style && style.outlineColor ? style.outlineColor : "#ffffff",
+                borderWeight: style && style.borderWeight != null ? style.borderWeight : 0,
+                lineJoin: "round",
+                lineCap: "round",
+            });
+            amapInstance.add(pl);
+            amapPolylines.push(pl);
+            return pl;
+        }
+
+        function drawPolylinePaths(paths, style) {
+            if (!Array.isArray(paths) || paths.length === 0) return;
+            paths.forEach(function(path) {
+                drawPolylinePath(path, style);
+            });
+        }
+
+        function flattenPolylinePaths(paths) {
+            if (!Array.isArray(paths) || paths.length === 0) return [];
+            var points = [];
+            paths.forEach(function(path) {
+                if (!Array.isArray(path) || path.length === 0) return;
+                path.forEach(function(p, idx) {
+                    if (!p) return;
+                    // 相邻子段的连接点可能重复，避免重复点影响分段查找。
+                    if (points.length > 0 && idx === 0) {
+                        var prev = points[points.length - 1];
+                        if (prev && prev.lng === p.lng && prev.lat === p.lat) {
+                            return;
+                        }
+                    }
+                    points.push(p);
+                });
+            });
+            return points;
+        }
+
+        function lngLatToArray(point) {
+            if (!point) return null;
+            if (Array.isArray(point) && point.length >= 2) {
+                return [Number(point[0]), Number(point[1])];
+            }
+            if (typeof point === "object") {
+                var lng = typeof point.getLng === "function" ? point.getLng() : point.lng;
+                var lat = typeof point.getLat === "function" ? point.getLat() : point.lat;
+                if (lng != null && lat != null) {
+                    return [Number(lng), Number(lat)];
+                }
+            }
+            return null;
+        }
+
+        function squaredDistance(a, b) {
+            var aa = lngLatToArray(a);
+            var bb = lngLatToArray(b);
+            if (!aa || !bb) return Number.POSITIVE_INFINITY;
+            var dx = aa[0] - bb[0];
+            var dy = aa[1] - bb[1];
+            return dx * dx + dy * dy;
+        }
+
+        function findNearestPathIndex(points, target, startIndex) {
+            if (!Array.isArray(points) || points.length === 0) return -1;
+            var from = Math.max(0, Number(startIndex) || 0);
+            var bestIdx = -1;
+            var bestDist = Number.POSITIVE_INFINITY;
+            for (var i = from; i < points.length; i++) {
+                var d = squaredDistance(points[i], target);
+                if (d < bestDist) {
+                    bestDist = d;
+                    bestIdx = i;
+                }
+            }
+            return bestIdx;
+        }
+
+        function buildRouteCheckpoints(route) {
+            var checkpoints = [];
+            var origin = parseLngLat(route && route.origin_location);
+            if (origin) checkpoints.push(origin);
+
+            var wpLocs = Array.isArray(route && route.waypoint_locations)
+                ? route.waypoint_locations
+                : [];
+            wpLocs.forEach(function(loc) {
+                var wp = parseLngLat(loc);
+                if (wp) checkpoints.push(wp);
+            });
+
+            var dest = parseLngLat(route && route.destination_location);
+            if (dest) checkpoints.push(dest);
+            return checkpoints;
+        }
+
+        function splitPolylineByCheckpoints(paths, checkpoints) {
+            var points = flattenPolylinePaths(paths);
+            if (points.length < 2 || !Array.isArray(checkpoints) || checkpoints.length < 2) {
+                return [];
+            }
+
+            var splitIndices = [0];
+            var cursor = 0;
+            for (var i = 1; i < checkpoints.length - 1; i++) {
+                var idx = findNearestPathIndex(points, checkpoints[i], cursor);
+                if (idx <= cursor || idx >= points.length - 1) {
+                    continue;
+                }
+                splitIndices.push(idx);
+                cursor = idx;
+            }
+            splitIndices.push(points.length - 1);
+
+            var legPaths = [];
+            for (var j = 1; j < splitIndices.length; j++) {
+                var start = splitIndices[j - 1];
+                var end = splitIndices[j];
+                if (end - start < 1) continue;
+                var leg = points.slice(start, end + 1);
+                if (leg.length >= 2) legPaths.push(leg);
+            }
+            return legPaths;
+        }
+
+        function drawWaypointLegs(paths, route) {
+            var checkpoints = buildRouteCheckpoints(route);
+            if (checkpoints.length < 3) return false;
+
+            var legPaths = splitPolylineByCheckpoints(paths, checkpoints);
+            if (!legPaths.length) return false;
+
+            var legPalette = ["#2563eb", "#16a34a", "#d97706", "#db2777", "#7c3aed", "#0891b2"];
+            legPaths.forEach(function(leg, idx) {
+                drawPolylinePath(leg, {
+                    color: legPalette[idx % legPalette.length],
+                    weight: 7,
+                    opacity: 0.95,
+                    dashed: false,
+                    zIndex: 95,
+                    showDir: true,
+                });
+            });
+            return true;
+        }
+
+        function styleForSegment(seg, busColorMap, usedBusColorCountRef) {
+            var segType = (seg.type || "").toLowerCase();
+
+            if (segType === "walking") {
+                return {
+                    color: "#64748b",
+                    weight: 5,
+                    opacity: 0.9,
+                    dashed: true,
+                    zIndex: 92,
+                };
+            }
+
+            if (segType === "bus") {
+                var busPalette = ["#2563eb", "#16a34a", "#d97706", "#db2777", "#7c3aed", "#0891b2"];
+                var lineName = seg.line_name || ("bus_" + usedBusColorCountRef.count);
+                if (!busColorMap[lineName]) {
+                    busColorMap[lineName] = busPalette[usedBusColorCountRef.count % busPalette.length];
+                    usedBusColorCountRef.count += 1;
+                }
+                return {
+                    color: busColorMap[lineName],
+                    weight: 7,
+                    opacity: 0.96,
+                    dashed: false,
+                    zIndex: 96,
+                };
+            }
+
+            return {
+                color: "#2563eb",
+                weight: 7,
+                opacity: 0.94,
+                dashed: false,
+                zIndex: 95,
+                showDir: true,
+            };
+        }
+
+        function drawInactiveRoute(option, route) {
+            var polyline = getOptionPolyline(option, route);
+            var paths = parsePolylineToPaths(polyline);
+            drawPolylinePaths(paths, {
+                color: "#94a3b8",
+                weight: 4,
+                opacity: 0.45,
+                dashed: false,
+                zIndex: 70,
+            });
+        }
+
+        function drawActiveRoute(option, route) {
+            if (!option) return;
+
+            var mode = String((route && (route.route_mode || route.mode)) || "").toLowerCase();
+            var hasWaypoints = Array.isArray(route && route.waypoint_locations)
+                && route.waypoint_locations.length > 0;
+
+            // 非公交场景下，若存在途经点，优先按“起点→途经点→终点”分段着色绘制。
+            if (hasWaypoints && mode !== "transit") {
+                var waypointPaths = parsePolylineToPaths(getOptionPolyline(option, route));
+                if (drawWaypointLegs(waypointPaths, route)) {
+                    return;
+                }
+            }
+
+            var busColorMap = {};
+            var usedBusColorCountRef = { count: 0 };
+
+            if (Array.isArray(option.segments) && option.segments.length > 0) {
+                var hasValidSegment = false;
+                option.segments.forEach(function(seg) {
+                    var segPaths = parsePolylineToPaths(seg.polyline || "");
+                    if (!segPaths.length) return;
+                    hasValidSegment = true;
+                    var style = styleForSegment(seg, busColorMap, usedBusColorCountRef);
+                    drawPolylinePaths(segPaths, style);
+                });
+
+                if (hasValidSegment) {
+                    return;
+                }
+            }
+
+            var polyline = getOptionPolyline(option, route);
+            var paths = parsePolylineToPaths(polyline);
+            drawPolylinePaths(paths, {
+                color: "#2563eb",
+                weight: 7,
+                opacity: 0.94,
+                dashed: false,
+                zIndex: 95,
+                showDir: true,
+            });
+        }
+
+        function addRouteMarker(position, htmlText) {
+            if (!position) return;
+            var marker = new AMap.Marker({
+                position: position,
+                content: htmlText,
+                anchor: "center",
+                offset: new AMap.Pixel(0, 0),
+                zIndex: 120,
+            });
+            amapInstance.add(marker);
+            amapMarkers.push(marker);
+        }
+
+        async function showRouteOnMap(route) {
             var map = ensureMap();
             if (!map) return;
+
+            latestRoutePayload = route;
+            renderRouteSelector(route);
             clearMapOverlays();
+
+            var routeOptions = getRouteOptions(route);
+            if (!routeOptions.length) return;
+            if (selectedRouteIndex >= routeOptions.length) {
+                selectedRouteIndex = 0;
+            }
+
+            var selectedOption = routeOptions[selectedRouteIndex];
 
             var originLngLat = parseLngLat(route.origin_location);
             var destLngLat = parseLngLat(route.destination_location);
 
-            // 起点标注
             if (originLngLat) {
-                var startMarker = new AMap.Marker({
-                    position: originLngLat,
-                    content: '<div style="background:#0f766e;color:#fff;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:bold;white-space:nowrap;">起 ' + (route.origin_name || '') + '</div>',
-                    offset: new AMap.Pixel(-40, -12),
-                });
-                map.add(startMarker);
-                amapMarkers.push(startMarker);
+                addRouteMarker(
+                    originLngLat,
+                    '<div style="background:#0f766e;color:#fff;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:bold;white-space:nowrap;">起 ' + (route.origin_name || '') + '</div>'
+                );
             }
 
-            // 终点标注
             if (destLngLat) {
-                var endMarker = new AMap.Marker({
-                    position: destLngLat,
-                    content: '<div style="background:#b45309;color:#fff;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:bold;white-space:nowrap;">终 ' + (route.destination_name || '') + '</div>',
-                    offset: new AMap.Pixel(-40, -12),
-                });
-                map.add(endMarker);
-                amapMarkers.push(endMarker);
+                addRouteMarker(
+                    destLngLat,
+                    '<div style="background:#b45309;color:#fff;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:bold;white-space:nowrap;">终 ' + (route.destination_name || '') + '</div>'
+                );
             }
 
-            // 路线折线 — AMap v5 polyline: "lng,lat;lng,lat;..." 多段用 ; 拼接
-            if (route.polyline) {
-                var pathArr = [];
-                var pairs = route.polyline.split(";");
-                pairs.forEach(function(pair) {
-                    var coords = pair.trim().split(",");
-                    if (coords.length >= 2) {
-                        var lng = parseFloat(coords[0]);
-                        var lat = parseFloat(coords[1]);
-                        if (!isNaN(lng) && !isNaN(lat)) {
-                            pathArr.push(new AMap.LngLat(lng, lat));
-                        }
-                    }
+            var wpLocs = Array.isArray(route.waypoint_locations) ? route.waypoint_locations : [];
+            var wpNames = Array.isArray(route.waypoints) ? route.waypoints : [];
+            wpLocs.forEach(function(loc, idx) {
+                var lngLat = parseLngLat(loc);
+                if (!lngLat) return;
+                addRouteMarker(
+                    lngLat,
+                    '<div style="background:#7c3aed;color:#fff;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:bold;white-space:nowrap;">途' + (idx + 1) + ' ' + (wpNames[idx] || '') + '</div>'
+                );
+            });
+
+            var serviceDrawn = false;
+            if (!route || !route._service_already_tried) {
+                serviceDrawn = await drawRouteByAmapNavigationService(route);
+            }
+            if (!serviceDrawn) {
+                routeOptions.forEach(function(opt, idx) {
+                    if (idx === selectedRouteIndex) return;
+                    drawInactiveRoute(opt, route);
                 });
-                if (pathArr.length > 1) {
-                    amapPolyline = new AMap.Polyline({
-                        path: pathArr,
-                        strokeColor: "#2563eb",
-                        strokeWeight: 6,
-                        strokeOpacity: 0.85,
-                        lineJoin: "round",
-                        lineCap: "round",
-                    });
-                    map.add(amapPolyline);
+                drawActiveRoute(selectedOption, route);
+                var fitItems = amapMarkers.concat(amapPolylines);
+                if (fitItems.length > 0) {
+                    map.setFitView(fitItems, false, [70, 70, 70, 70]);
                 }
-            }
-
-            // 自适应视野
-            var fitItems = amapMarkers.slice();
-            if (amapPolyline) fitItems.push(amapPolyline);
-            if (fitItems.length > 0) {
-                map.setFitView(fitItems, false, [60, 60, 60, 60]);
+            } else {
+                // 导航服务已自动绘制路线，按全覆盖物自适应视野。
+                map.setFitView(undefined, false, [70, 70, 70, 70]);
             }
         }
 
@@ -2687,6 +3667,17 @@
             await initAMap();
             connect();
         };
+
+        window.addEventListener("beforeunload", function() {
+            if (amapInstance && typeof amapInstance.destroy === "function") {
+                try {
+                    amapInstance.destroy();
+                } catch (e) {
+                    console.warn("[MAP] destroy failed:", e);
+                }
+                amapInstance = null;
+            }
+        });
     </script>
 </body>
 </html>

@@ -108,6 +108,9 @@ class RouteResult(BaseModel):
     destination_name: str
     origin_location: str
     destination_location: str
+    route_mode: Optional[str] = None
+    waypoints: List[str] = Field(default_factory=list)
+    waypoint_locations: List[str] = Field(default_factory=list)
     distance: Optional[str] = None
     duration: Optional[str] = None
     taxi_cost: Optional[str] = None

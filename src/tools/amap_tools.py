@@ -39,8 +39,20 @@ async def close_amap_session() -> None:
 
 async def _amap_get(path: str, params: dict) -> dict:
     """发送高德API GET请求，带错误日志"""
-    params["key"] = AMAP_API_KEY
-    url = f"{AMAP_BASE}{path}?{urllib.parse.urlencode(params)}"
+    request_params = dict(params)
+    request_params["key"] = AMAP_API_KEY
+
+    # 在实际请求前打印请求参数（隐藏 key），便于终端排查。
+    log_params = dict(request_params)
+    if "key" in log_params:
+        log_params["key"] = "***"
+    logger.info(
+        "[AMAP] REQUEST path=%s params=%s",
+        path,
+        json.dumps(log_params, ensure_ascii=False, sort_keys=True),
+    )
+
+    url = f"{AMAP_BASE}{path}?{urllib.parse.urlencode(request_params)}"
     logger.info("[AMAP] GET %s", url.replace(AMAP_API_KEY, "***"))
     t0 = time.perf_counter()
     session = await _get_amap_session()
@@ -267,160 +279,3 @@ async def reverse_geocode(location: str) -> ToolResponse:
     }, ensure_ascii=False))
 
 
-# ────────────────── 路线规划 ──────────────────
-
-async def  route_planning(
-    origin: str,
-    destination: str,
-    mode: str = "driving",
-    waypoints: str = "",
-    strategy: str = "",
-    city: str = "",
-    include_polyline: bool = False,
-) -> ToolResponse:
-    """规划从起点到终点的路线。
-
-    Args:
-        origin: 起点经纬度，格式"lng,lat"
-        destination: 终点经纬度，格式"lng,lat"
-        mode: 出行方式 driving|walking|transit|bicycling
-        waypoints: 途经点经纬度，多个用;分隔
-        strategy: 路线策略(仅driving有效)，如"32"(躲避拥堵+不走高速)
-        city: 城市名称或编码(公交模式必填)
-
-    Returns:
-        路线规划结果
-    """
-    mode_paths = {
-        "driving": "/v5/direction/driving",
-        "walking": "/v5/direction/walking",
-        "transit": "/v5/direction/transit/integrated",
-        "bicycling": "/v5/direction/bicycling",
-    }
-    path = mode_paths.get(mode, "/v5/direction/driving")
-    params = {
-        "origin": origin,
-        "destination": destination,
-        "show_fields": "cost,polyline" if include_polyline else "cost",
-    }
-    if waypoints:
-        params["waypoints"] = waypoints
-    if strategy and mode == "driving":
-        params["strategy"] = strategy
-    if mode == "transit":
-        # 公交模式必须传城市 adcode 参数
-        # 从起点坐标自动反查 adcode（取前4位得到市级编码）
-        # 这么做是为了减少上游传 city 的要求，优先让工具层自洽。
-        regeo = await _amap_get("/v3/geocode/regeo", {
-            "location": origin, "output": "JSON",
-        })
-        adcode = (
-            regeo.get("regeocode", {})
-            .get("addressComponent", {})
-            .get("adcode", "")
-        )
-        city_code = adcode[:4] if len(adcode) >= 4 else adcode
-        if city_code:
-            params["city1"] = city_code
-            params["city2"] = city_code
-
-    data = await _amap_get(path, params)
-    if data.get("status") == "1":
-        route = data.get("route", {})
-
-        if mode == "transit":
-            # ── 公交模式：transits[].segments[].bus/walking ──
-            transits = route.get("transits", [])
-            if transits:
-                best = transits[0]
-                steps = []
-                polyline_parts = []
-
-                def _extract_polyline(raw):
-                    """从 polyline 字段提取字符串（可能是 str 或 dict）"""
-                    if isinstance(raw, str) and raw:
-                        return raw
-                    if isinstance(raw, dict):
-                        return raw.get("polyline", "")
-                    return ""
-
-                for seg in best.get("segments", []):
-                    # 步行段
-                    walking = seg.get("walking")
-                    if walking:
-                        w_dist = walking.get("distance", "")
-                        steps.append({
-                            "instruction": f"步行{w_dist}米",
-                            "distance": w_dist,
-                        })
-                        for ws in walking.get("steps", []):
-                            pl = _extract_polyline(ws.get("polyline", ""))
-                            if pl:
-                                polyline_parts.append(pl)
-                    # 公交段
-                    bus = seg.get("bus", {})
-                    for bl in bus.get("buslines", []):
-                        dep = bl.get("departure_stop", {})
-                        arr = bl.get("arrival_stop", {})
-                        name = bl.get("name", "公交")
-                        via_num = bl.get("via_num", "")
-                        instr = f"乘坐{name}，从{dep.get('name', '')}上车"
-                        if arr.get("name"):
-                            instr += f"，到{arr['name']}下车"
-                        if via_num:
-                            instr += f"（经过{via_num}站）"
-                        steps.append({
-                            "instruction": instr,
-                            "distance": bl.get("distance", ""),
-                        })
-                        pl = _extract_polyline(bl.get("polyline", ""))
-                        if pl:
-                            polyline_parts.append(pl)
-
-                best_cost = best.get("cost", {})
-                duration = best_cost.get("duration", "") if isinstance(best_cost, dict) else ""
-                transit_fee = best_cost.get("transit_fee", "") if isinstance(best_cost, dict) else ""
-                return _text_response(json.dumps({
-                    "status": "ok",
-                    "distance": best.get("distance", ""),
-                    "duration": duration,
-                    "transit_fee": transit_fee,
-                    "taxi_cost": route.get("taxi_cost", ""),
-                    "steps": steps,
-                    "polyline": ";".join(polyline_parts),
-                    "origin_location": origin,
-                    "destination_location": destination,
-                }, ensure_ascii=False))
-        else:
-            # ── 驾车/步行/骑行模式 ──
-            paths = route.get("paths", [])
-            if paths:
-                best = paths[0]
-                steps = []
-                polyline_parts = []
-                for s in best.get("steps", [])[:15]:
-                    steps.append({
-                        "instruction": s.get("instruction", s.get("action", "")),
-                        "distance": s.get("step_distance", s.get("distance", "")),
-                    })
-                    pl = s.get("polyline", "")
-                    if pl:
-                        polyline_parts.append(pl)
-                best_cost = best.get("cost", {})
-                duration = best_cost.get("duration", "") if isinstance(best_cost, dict) else best.get("duration", "")
-                return _text_response(json.dumps({
-                    "status": "ok",
-                    "distance": best.get("distance", ""),
-                    "duration": duration,
-                    "taxi_cost": route.get("taxi_cost", ""),
-                    "steps": steps,
-                    "polyline": ";".join(polyline_parts),
-                    "origin_location": origin,
-                    "destination_location": destination,
-                }, ensure_ascii=False))
-
-    return _text_response(json.dumps({
-        "status": "error",
-        "message": "路线规划失败",
-        "api_info": data.get("info", ""),
-    }, ensure_ascii=False))

@@ -17,6 +17,7 @@ import os
 import re
 import sys
 import traceback
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -40,7 +41,20 @@ from agentscope.realtime import (
 )
 from agentscope.tool import Toolkit
 from models.intent_schema import IntentResult
-from models.nav_result_schema import NeedSelectionResult
+from services.nav_routing import (
+    _ensure_map_fields,
+    _send_route_result_fast,
+    _try_direct_route_planning,
+    _try_fast_nav_without_llm,
+    _try_life_service_nearby_retry,
+)
+from services.nav_utils import (
+    _build_nav_broadcast_text,
+    _get_missing_slots,
+    _parse_nav_result,
+    _should_use_current_location,
+    _validate_need_selection_result,
+)
 
 from prompts.interaction_prompt import INTERACTION_PROMPT
 from config.settings import (
@@ -48,19 +62,23 @@ from config.settings import (
     AMAP_API_KEY,
     AMAP_WEB_KEY,
     AMAP_WEB_SECRET,
+    AMAP_WEB_SERVICE_HOST,
     REALTIME_MODEL_NAME,
     NAV_TRIGGER_KEYWORDS,
 )
 
-app = FastAPI()
+@asynccontextmanager
+async def _app_lifespan(_: FastAPI):
+    """应用生命周期：关闭时清理全局资源。"""
+    try:
+        yield
+    finally:
+        from tools.amap_tools import close_amap_session
+
+        await close_amap_session()
 
 
-@app.on_event("shutdown")
-async def _shutdown_cleanup() -> None:
-    """应用关闭时清理全局资源。"""
-    from tools.amap_tools import close_amap_session
-
-    await close_amap_session()
+app = FastAPI(lifespan=_app_lifespan)
 
 
 # ── 导航关键词检测 ──
@@ -76,6 +94,7 @@ _CONTEXT_CONTINUATION_PATTERN = re.compile(
 
 # ── 挂起的 POI 选择状态（session_id → 选择上下文）──
 _pending_nav: dict = {}
+_pending_nav_route_broadcast: dict = {}
 
 # ── 会话导航上下文记忆（基于 AgentScope InMemoryMemory）──
 _nav_context_memory = InMemoryMemory()
@@ -147,444 +166,55 @@ async def _save_nav_context(session_id: str, slots: dict) -> None:
     )
 
 
+async def _build_nav_memory_hint_for_llm(session_id: str) -> str:
+    """构建仅供大模型参考的导航记忆提示，不在后端直接改写槽位。"""
+    payload = {}
+
+    prev = await _load_nav_context(session_id)
+    if isinstance(prev, dict) and prev:
+        allowed_keys = (
+            "origin",
+            "origin_location",
+            "destination",
+            "destination_location",
+            "travel_mode",
+            "waypoints",
+            "waypoint_locations",
+            "poi_type",
+            "poi_constraint",
+        )
+        slots = {}
+        for key in allowed_keys:
+            val = prev.get(key)
+            if val not in (None, "", [], {}):
+                slots[key] = val
+        if slots:
+            payload["last_nav_slots"] = slots
+
+    current_loc = _session_current_location.get(session_id)
+    if isinstance(current_loc, dict) and current_loc.get("location"):
+        payload["current_location"] = {
+            "name": current_loc.get("name") or "当前位置",
+            "location": current_loc.get("location"),
+            "source": current_loc.get("source"),
+            "accuracy": current_loc.get("accuracy"),
+        }
+
+    if not payload:
+        return ""
+
+    return (
+        "\n[导航记忆，仅供意图识别与槽位提取参考："
+        "请以用户本轮输入为最高优先级，不要机械继承旧槽位]"
+        f"\n{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
 def detect_nav_intent(text: str) -> bool:
     """检测文本中是否包含导航意图关键词"""
     if not text or len(text.strip()) < 2:
         return False
     return bool(_NAV_PATTERN.search(text))
-
-
-def _get_missing_slots(slots: dict, intent_type: str = "") -> list[str]:
-    """按意图类型返回缺失的必要槽位。"""
-    missing = []
-
-    # 生活服务类（如“附近加油站”）不应强制要求 destination。
-    if intent_type == "life_service":
-        required = ("origin", "poi_type")
-    else:
-        required = ("origin", "destination", "travel_mode")
-
-    for key in required:
-        if not slots.get(key):
-            missing.append(key)
-    return missing
-
-
-def _should_use_current_location(
-    user_text: str,
-    intent_type: str,
-    slots: dict,
-) -> bool:
-    """判断在起点缺失时，是否优先采用当前位置补全。"""
-    if slots.get("origin"):
-        return False
-
-    # 生活服务搜索默认可用当前位置作为检索中心。
-    if intent_type == "life_service":
-        return True
-
-    text = (user_text or "").strip()
-    if not text:
-        return False
-
-    # 明确是“继续上一段路线”时，优先沿用上下文而不是当前位置。
-    if _CONTEXT_CONTINUATION_PATTERN.search(text):
-        return False
-
-    # 用户显式提到“我现在/附近”等，优先当前位置。
-    if _CURRENT_LOCATION_HINT_PATTERN.search(text):
-        return True
-
-    # 常见“去某地”且未给起点时，也优先当前位置。
-    return bool(slots.get("destination") or slots.get("poi_type"))
-
-
-def _build_nav_broadcast_text(nav_data: Optional[dict], user_text: str) -> str:
-    """将导航结果转为精简口语化文本，供 RealtimeAgent 语音播报。"""
-    if not nav_data or not isinstance(nav_data, dict):
-        return f"用户问了：{user_text}，但未能获取导航结果，请告知用户稍后重试。"
-
-    nav_result = nav_data.get("navigation_result")
-    slots = nav_data.get("slots", {})
-    intent_type = nav_data.get("intent_type", "") or ""
-    poi_type = slots.get("poi_type", "")
-    poi_constraint = slots.get("poi_constraint", "")
-    origin = slots.get("origin", "出发地")
-    dest = slots.get("destination", "目的地")
-
-    if not nav_result or not isinstance(nav_result, dict):
-        return (
-            f"用户想从{origin}到{dest}，但导航校验未返回有效结果，"
-            "请告诉用户稍后重试。"
-        )
-
-    status = nav_result.get("status", "")
-    if status == "need_selection":
-        if intent_type == "life_service":
-            return (
-                f"用户想在{origin}附近找{poi_type or '目标地点'}，"
-                "存在多个候选，请引导用户选择具体地点。"
-            )
-        return (
-            f"用户想从{origin}到{dest}，地点存在歧义，"
-            "请引导用户从候选地点中选择。"
-        )
-
-    if status not in ("ok", "success"):
-        if intent_type == "life_service":
-            msg = nav_result.get("message") or ""
-            constraint = poi_constraint or "当前范围"
-            if msg:
-                return (
-                    f"用户想在{origin}附近找{poi_type or '目标地点'}（{constraint}），"
-                    f"当前未找到。请告知用户：{msg}，并建议放宽搜索半径后重试。"
-                )
-            return (
-                f"用户想在{origin}附近找{poi_type or '目标地点'}（{constraint}），"
-                "当前未找到，请建议放宽搜索半径后重试。"
-            )
-        return (
-            f"用户想从{origin}到{dest}，但导航路线规划失败，"
-            "请告诉用户检查地点后重试。"
-        )
-
-    origin_name = nav_result.get("origin_name", origin)
-    dest_name = nav_result.get("destination_name", dest)
-    distance = nav_result.get("distance", "")
-    taxi_cost = nav_result.get("taxi_cost", "")
-
-    steps = nav_result.get("steps", [])
-    first_steps = steps[:3]
-    step_texts = "、".join(s.get("instruction", "") for s in first_steps)
-
-    parts = [
-        f"[请用口语化方式播报以下导航结果]",
-        f"从{origin_name}到{dest_name}，",
-    ]
-    if distance:
-        km = round(int(distance) / 1000, 1) if distance.isdigit() else distance
-        parts.append(f"全程约{km}公里，")
-    if taxi_cost:
-        parts.append(f"预计打车{taxi_cost}元，")
-    if step_texts:
-        parts.append(f"先{step_texts}。")
-    if len(steps) > 3:
-        parts.append(f"共{len(steps)}个导航步骤，已发送到您的设备上。")
-
-    return "".join(parts)
-
-
-def _validate_need_selection_result(nav_result: dict) -> dict:
-    """严格校验 need_selection 输出格式，不做兼容转换。"""
-    validated = NeedSelectionResult.model_validate(nav_result)
-    result = validated.model_dump(mode="python")
-
-    # 前端需要 merged candidates 字段，按接口要求直接生成。
-    merged = []
-    for c in result["origin_candidates"]:
-        item = dict(c)
-        item["selection_group"] = "origin"
-        merged.append(item)
-    for c in result["destination_candidates"]:
-        item = dict(c)
-        item["selection_group"] = "destination"
-        merged.append(item)
-    result["candidates"] = merged
-    return result
-
-
-async def _ensure_map_fields(
-    nav_result: dict,
-    slots: dict,
-    *,
-    fetch_polyline: bool = True,
-) -> dict:
-    """确保路线结果中包含前端地图所需的 origin_location / destination_location / polyline。
-
-    LLM 不输出 polyline（太长会导致生成极慢），此函数直接调 API 获取。
-    """
-    # 回填坐标
-    if not nav_result.get("origin_location") and slots.get("origin_location"):
-        nav_result["origin_location"] = slots["origin_location"]
-    if not nav_result.get("destination_location") and slots.get("destination_location"):
-        nav_result["destination_location"] = slots["destination_location"]
-
-    # 通过 API 获取 polyline（可按需异步回填）
-    origin_loc = nav_result.get("origin_location", "")
-    dest_loc = nav_result.get("destination_location", "")
-    polyline = nav_result.get("polyline", "")
-    if fetch_polyline and origin_loc and dest_loc and (not polyline or len(polyline) < 50):
-        logger.info("[NAV] 通过 API 获取 polyline ...")
-        try:
-            from tools.amap_tools import route_planning
-            mode = slots.get("travel_mode", "driving")
-            resp = await route_planning(
-                origin_loc,
-                dest_loc,
-                mode=mode,
-                include_polyline=True,
-            )
-            raw = resp.content[0]
-            text = raw["text"] if isinstance(raw, dict) else raw.text
-            route_data = json.loads(text)
-            if route_data.get("status") in ("ok", "success"):
-                if route_data.get("polyline"):
-                    nav_result["polyline"] = route_data["polyline"]
-                if not nav_result.get("origin_location"):
-                    nav_result["origin_location"] = route_data.get("origin_location", "")
-                if not nav_result.get("destination_location"):
-                    nav_result["destination_location"] = route_data.get("destination_location", "")
-        except Exception as e:
-            logger.warning("[NAV] polyline 获取失败: %s", e)
-
-    return nav_result
-
-
-async def _backfill_polyline_and_push(
-    websocket: WebSocket,
-    nav_result: dict,
-    slots: dict,
-) -> None:
-    """异步补全 polyline，并将更新后的路线结果再次推送到前端。"""
-    try:
-        if nav_result.get("polyline"):
-            return
-
-        await _ensure_map_fields(nav_result, slots, fetch_polyline=True)
-        if nav_result.get("polyline"):
-            await websocket.send_json({
-                "type": "nav_route_result",
-                "route_result": nav_result,
-            })
-    except Exception as e:
-        logger.warning("[NAV] 异步回填 polyline 失败: %s", e)
-
-
-async def _send_route_result_fast(
-    websocket: WebSocket,
-    nav_result: dict,
-    slots: dict,
-) -> None:
-    """优先返回首屏路线结果，再异步补全 polyline。"""
-    await _ensure_map_fields(nav_result, slots, fetch_polyline=False)
-    await websocket.send_json({
-        "type": "nav_route_result",
-        "route_result": nav_result,
-    })
-    asyncio.create_task(_backfill_polyline_and_push(websocket, nav_result, slots))
-
-
-async def _try_direct_route_planning(slots: dict) -> Optional[dict]:
-    """坐标齐全时直接调用高德路线规划，绕过导航校验 LLM。"""
-    origin_loc = slots.get("origin_location", "")
-    dest_loc = slots.get("destination_location", "")
-    if not origin_loc or not dest_loc:
-        return None
-
-    try:
-        from tools.amap_tools import route_planning
-
-        mode = slots.get("travel_mode", "driving")
-        resp = await route_planning(
-            origin=origin_loc,
-            destination=dest_loc,
-            mode=mode,
-            include_polyline=False,
-        )
-        raw = resp.content[0]
-        text = raw["text"] if isinstance(raw, dict) else raw.text
-        route_data = json.loads(text)
-        if route_data.get("status") not in ("ok", "success"):
-            return None
-
-        return {
-            "status": "success",
-            "origin_name": slots.get("origin", ""),
-            "destination_name": slots.get("destination", ""),
-            "origin_location": origin_loc,
-            "destination_location": dest_loc,
-            "distance": route_data.get("distance", ""),
-            "duration": route_data.get("duration", ""),
-            "taxi_cost": route_data.get("taxi_cost", ""),
-            "steps": route_data.get("steps", []),
-        }
-    except Exception as e:
-        logger.warning("[NAV] 直接路线规划失败，回退 LLM 流程: %s", e)
-        return None
-
-
-def _tool_response_to_json(resp: object) -> Optional[dict]:
-    """将 ToolResponse 转为 JSON 字典。"""
-    try:
-        raw = resp.content[0]
-        text = raw["text"] if isinstance(raw, dict) else raw.text
-        data = json.loads(text)
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
-
-
-def _extract_radius_from_constraint(text: str) -> int:
-    """从约束文本提取半径(米)，提取失败返回 500。"""
-    s = (text or "").strip()
-    if not s:
-        return 500
-
-    m_km = re.search(r"(\d+(?:\.\d+)?)\s*公里", s)
-    if m_km:
-        return max(100, int(float(m_km.group(1)) * 1000))
-
-    m_m = re.search(r"(\d+)\s*米", s)
-    if m_m:
-        return max(100, int(m_m.group(1)))
-
-    return 500
-
-
-def _build_radius_retry_list(base_radius: int) -> list[int]:
-    """构建附近搜索扩圈序列。"""
-    candidates = [base_radius, 500, 1000, 2000]
-    radii = []
-    for r in candidates:
-        rr = max(100, min(5000, int(r)))
-        if rr not in radii:
-            radii.append(rr)
-    return radii
-
-
-async def _try_life_service_nearby_retry(slots: dict) -> Optional[dict]:
-    """life_service 在小半径无结果时自动扩圈重试。"""
-    origin_loc = slots.get("origin_location", "")
-    poi_type = slots.get("poi_type", "")
-    if not origin_loc or not poi_type:
-        return None
-
-    try:
-        lng, lat = [x.strip() for x in origin_loc.split(",", 1)]
-    except Exception:
-        return None
-
-    from tools.amap_tools import search_nearby_pois
-
-    base_radius = _extract_radius_from_constraint(slots.get("poi_constraint", ""))
-    radii = _build_radius_retry_list(base_radius)
-
-    for radius in radii:
-        resp = await search_nearby_pois(lng, lat, poi_type, radius=radius)
-        data = _tool_response_to_json(resp)
-        if not isinstance(data, dict):
-            continue
-
-        if data.get("status") == "ok" and data.get("pois"):
-            dest_cands = []
-            for p in data.get("pois", [])[:5]:
-                dest_cands.append({
-                    "name": p.get("name", ""),
-                    "address": p.get("address", ""),
-                    "location": p.get("location", ""),
-                    "cityname": p.get("cityname", ""),
-                    "tel": p.get("tel", ""),
-                    "type_name": p.get("type", ""),
-                    "distance": str(p.get("distance", "")) if p.get("distance") is not None else "",
-                })
-            if dest_cands:
-                slots["poi_constraint"] = f"附近{radius}米"
-                return {
-                    "status": "need_selection",
-                    "origin_candidates": [],
-                    "destination_candidates": dest_cands,
-                    "origin_name": slots.get("origin", "当前位置"),
-                    "origin_location": origin_loc,
-                    "destination_name": None,
-                    "destination_location": None,
-                }
-
-    max_radius = max(radii) if radii else base_radius
-    return {
-        "status": "error",
-        "message": f"在当前位置{max_radius}米内未找到{poi_type}，建议放宽范围后重试。",
-    }
-
-
-async def _try_fast_nav_without_llm(slots: dict) -> Optional[dict]:
-    """优先走纯高德快路径：歧义检测 + 直接规划，避免导航校验 LLM 时延。"""
-    origin_name = slots.get("origin", "")
-    dest_name = slots.get("destination", "")
-    mode = slots.get("travel_mode", "")
-    if not origin_name or not dest_name or not mode:
-        return None
-
-    origin_loc = slots.get("origin_location", "")
-    dest_loc = slots.get("destination_location", "")
-
-    # 坐标已齐全：直接路线规划
-    if origin_loc and dest_loc:
-        return await _try_direct_route_planning(slots)
-
-    from tools.amap_tools import geocode
-
-    logger.info("[NAV-FAST] 进入无LLM快路径 geocode 检测")
-
-    # 并发 geocode，减少等待
-    origin_task = None if origin_loc else geocode(origin_name)
-    dest_task = None if dest_loc else geocode(dest_name)
-
-    if origin_task and dest_task:
-        origin_resp, dest_resp = await asyncio.gather(origin_task, dest_task)
-    elif origin_task:
-        origin_resp = await origin_task
-        dest_resp = None
-    elif dest_task:
-        origin_resp = None
-        dest_resp = await dest_task
-    else:
-        origin_resp = None
-        dest_resp = None
-
-    origin_data = _tool_response_to_json(origin_resp) if origin_resp else {
-        "status": "ok",
-        "name": origin_name,
-        "location": origin_loc,
-    }
-    dest_data = _tool_response_to_json(dest_resp) if dest_resp else {
-        "status": "ok",
-        "name": dest_name,
-        "location": dest_loc,
-    }
-
-    if not origin_data or not dest_data:
-        return None
-
-    # 任一侧歧义：直接返回候选，避免等待 LLM 组织
-    if origin_data.get("status") == "need_selection" or dest_data.get("status") == "need_selection":
-        return {
-            "status": "need_selection",
-            "origin_candidates": origin_data.get("candidates", []) if origin_data.get("status") == "need_selection" else [],
-            "destination_candidates": dest_data.get("candidates", []) if dest_data.get("status") == "need_selection" else [],
-            "origin_name": origin_data.get("name") if origin_data.get("status") == "ok" else None,
-            "origin_location": origin_data.get("location") if origin_data.get("status") == "ok" else None,
-            "destination_name": dest_data.get("name") if dest_data.get("status") == "ok" else None,
-            "destination_location": dest_data.get("location") if dest_data.get("status") == "ok" else None,
-        }
-
-    # 无结果或错误：返回 None 回退到 LLM
-    if origin_data.get("status") != "ok" or dest_data.get("status") != "ok":
-        return None
-
-    # 两侧都已解析成功，直接路线规划
-    slots_with_loc = dict(slots)
-    slots_with_loc["origin"] = origin_data.get("name", origin_name) or origin_name
-    slots_with_loc["destination"] = dest_data.get("name", dest_name) or dest_name
-    slots_with_loc["origin_location"] = origin_data.get("location", origin_loc) or origin_loc
-    slots_with_loc["destination_location"] = dest_data.get("location", dest_loc) or dest_loc
-
-    direct_result = await _try_direct_route_planning(slots_with_loc)
-    if direct_result is None:
-        return None
-
-    # 同步写回，确保后续上下文一致
-    slots.update(slots_with_loc)
-    return direct_result
 
 
 # ═══════════════════════════════════════════
@@ -858,6 +488,19 @@ async def _broadcast_nav_summary(
     await _inject_text_to_agent(agent, session_id, summary)
 
 
+def _defer_nav_broadcast_until_frontend(
+    session_id: str,
+    slots: dict,
+    intent_type: str,
+) -> None:
+    """等待前端 JS API 回传完整路线，再进行语音播报。"""
+    _pending_nav_route_broadcast[session_id] = {
+        "slots": dict(slots or {}),
+        "intent_type": intent_type or "",
+    }
+    logger.info("[NAV] 等待前端回传完整路线用于播报 session=%s", session_id)
+
+
 async def _execute_navigation_with_slots(
     slots: dict,
     websocket: WebSocket,
@@ -894,12 +537,10 @@ async def _execute_navigation_with_slots(
             if fast_status in ("ok", "success"):
                 await _send_route_result_fast(websocket, fast_nav_result, slots)
                 await _send_nav_status(websocket, "done", "导航分析完成")
-                await _broadcast_nav_summary(
-                    agent,
+                _defer_nav_broadcast_until_frontend(
                     session_id,
-                    fast_nav_result,
                     slots,
-                    intent_type=intent_type,
+                    intent_type,
                 )
                 return
 
@@ -908,12 +549,10 @@ async def _execute_navigation_with_slots(
         if direct_result is not None:
             await _send_route_result_fast(websocket, direct_result, slots)
             await _send_nav_status(websocket, "done", "导航分析完成")
-            await _broadcast_nav_summary(
-                agent,
+            _defer_nav_broadcast_until_frontend(
                 session_id,
-                direct_result,
                 slots,
-                intent_type=intent_type,
+                intent_type,
             )
             return
 
@@ -951,6 +590,13 @@ async def _execute_navigation_with_slots(
                     nav_result["destination_name"] = dest_info["name"]
 
                 await _send_route_result_fast(websocket, nav_result, slots)
+                await _send_nav_status(websocket, "done", "导航分析完成")
+                _defer_nav_broadcast_until_frontend(
+                    session_id,
+                    slots,
+                    intent_type,
+                )
+                return
 
         await _send_nav_status(websocket, "done", "导航分析完成")
         await _broadcast_nav_summary(
@@ -1040,8 +686,14 @@ async def route_text_by_flowchart(
     """按流程图执行文本分流：意图判断 → 导航/闲聊 → RealtimeAgent。"""
     # 同一会话串行化分流处理，避免快速输入导致上下文并发覆盖。
     async with _get_session_route_lock(session_id):
+        llm_text = user_text
+        if detect_nav_intent(user_text):
+            memory_hint = await _build_nav_memory_hint_for_llm(session_id)
+            if memory_hint:
+                llm_text = f"{user_text}{memory_hint}"
+
         is_navigation, nav_data, _ = await run_nav_pipeline(
-            user_text, websocket,
+            llm_text, websocket,
         )
 
         # 查询当前视觉状态并融合到最终播报输入
@@ -1053,71 +705,56 @@ async def route_text_by_flowchart(
             slots = nav_data.get("slots", {})
             intent_type = nav_data.get("intent_type", "")
 
-            # 先尝试用当前位置补全起点（若本轮未给出 origin）。
+            # 在导航分流阶段做记忆补槽：
+            # 1) 识别是否应使用当前位置补起点
+            # 2) 识别是否应复用上轮起点/终点/出行方式
+            prev_slots = await _load_nav_context(session_id)
+
             current_loc = _session_current_location.get(session_id)
             origin_from_current_location = False
             if (
-                current_loc
+                isinstance(current_loc, dict)
                 and current_loc.get("location")
                 and _should_use_current_location(user_text, intent_type, slots)
             ):
                 slots["origin"] = current_loc.get("name") or "当前位置"
-                slots["origin_location"] = current_loc["location"]
+                slots["origin_location"] = current_loc.get("location")
                 origin_from_current_location = True
                 logger.info(
-                    "[NAV] 使用当前位置补全起点 origin=%s, location=%s",
+                    "[NAV-MEM] 使用当前位置补全起点 origin=%s, location=%s",
                     slots.get("origin", ""),
                     slots.get("origin_location", ""),
                 )
 
-            # 从会话上下文补全缺失槽位（如用户说"坐公交怎么走"，沿用上次起终点）
-            prev = await _load_nav_context(session_id)
-            if prev:
-                filled_from_context = set()
-
+            if isinstance(prev_slots, dict) and prev_slots:
+                # life_service 不复用 destination，避免误导到上轮终点。
                 if intent_type == "life_service":
-                    # 附近服务类场景只补 origin/travel_mode，禁止补 destination。
-                    # 目的地应由 poi_type 触发搜索得到，不能继承上次终点。
                     fill_keys = ("origin", "travel_mode")
                 else:
                     fill_keys = ("origin", "destination", "travel_mode")
 
+                filled_from_prev = set()
                 for key in fill_keys:
-                    if not slots.get(key) and prev.get(key):
-                        slots[key] = prev[key]
-                        filled_from_context.add(key)
-                        logger.info("[NAV] 从上下文补全 %s=%s", key, prev[key])
+                    if not slots.get(key) and prev_slots.get(key):
+                        slots[key] = prev_slots[key]
+                        filled_from_prev.add(key)
+                        logger.info("[NAV-MEM] 复用上轮槽位 %s=%s", key, prev_slots.get(key))
 
-                # 若本轮地点名称与上轮不同，清理可能残留的旧坐标，避免错配。
+                # 仅在对应名称来自上轮时复用对应坐标，避免名称与坐标错配。
                 if (
-                    slots.get("origin") and prev.get("origin")
-                    and slots["origin"] != prev["origin"]
+                    "origin" in filled_from_prev
+                    and not slots.get("origin_location")
+                    and prev_slots.get("origin_location")
                     and not origin_from_current_location
                 ):
-                    if slots.pop("origin_location", None):
-                        logger.info("[NAV] 起点变化，清理旧坐标 origin_location")
+                    slots["origin_location"] = prev_slots["origin_location"]
 
                 if (
-                    slots.get("destination") and prev.get("destination")
-                    and slots["destination"] != prev["destination"]
-                ):
-                    if slots.pop("destination_location", None):
-                        logger.info("[NAV] 终点变化，清理旧坐标 destination_location")
-
-                # 仅在"地点名称也沿用上下文"时，才复用对应坐标。
-                if (
-                    "origin" in filled_from_context
-                    and not slots.get("origin_location")
-                    and prev.get("origin_location")
-                ):
-                    slots["origin_location"] = prev["origin_location"]
-
-                if (
-                    "destination" in filled_from_context
+                    "destination" in filled_from_prev
                     and not slots.get("destination_location")
-                    and prev.get("destination_location")
+                    and prev_slots.get("destination_location")
                 ):
-                    slots["destination_location"] = prev["destination_location"]
+                    slots["destination_location"] = prev_slots["destination_location"]
 
             # 附近服务场景：显式清理 destination，避免误用上轮终点直出旧路线。
             if intent_type == "life_service":
@@ -1196,6 +833,15 @@ async def route_text_by_flowchart(
                 )
                 return  # 不播报，等待用户选择
 
+            if isinstance(nav_result, dict) and nav_result.get("status") in ("ok", "success"):
+                slots = (nav_data or {}).get("slots", {})
+                _defer_nav_broadcast_until_frontend(
+                    session_id,
+                    slots,
+                    (nav_data or {}).get("intent_type", ""),
+                )
+                return
+
             # 构建精简口语化摘要，避免向 RealtimeAgent 注入过大 JSON
             summary = _build_nav_broadcast_text(nav_data, user_text)
             if visual_state:
@@ -1211,18 +857,6 @@ async def route_text_by_flowchart(
             non_nav_text = f"{user_text}\n[视觉状态] {visual_state}"
 
         await _inject_text_to_agent(agent, session_id, non_nav_text)
-
-
-def _parse_nav_result(text: str) -> dict:
-    """严格解析智能体返回：仅允许单个 JSON 对象。"""
-    if not text:
-        raise ValueError("模型返回为空，无法解析 JSON")
-
-    parsed = json.loads(text)
-    if not isinstance(parsed, dict):
-        raise ValueError("模型返回不是 JSON 对象")
-    return parsed
-
 
 # ═══════════════════════════════════════════
 #  Whisper ASR 处理
@@ -1294,6 +928,7 @@ async def get_amap_key() -> dict:
     return {
         "key": AMAP_WEB_KEY or AMAP_API_KEY,
         "secret": AMAP_WEB_SECRET,
+        "service_host": AMAP_WEB_SERVICE_HOST,
     }
 
 
@@ -1662,12 +1297,45 @@ async def single_agent_endpoint(
                         ),
                     )
 
+            # ── 前端路线规划回传（用于注入完整 steps 播报）──
+            elif event_type == "nav_js_route_result":
+                route_result = data.get("route_result", {})
+                if not isinstance(route_result, dict):
+                    route_result = {}
+
+                pending_broadcast = _pending_nav_route_broadcast.pop(session_id, None)
+                slots = (pending_broadcast or {}).get("slots", {})
+                intent_type = (pending_broadcast or {}).get("intent_type", "")
+
+                if route_result.get("origin_name") and not slots.get("origin"):
+                    slots["origin"] = route_result.get("origin_name")
+                if route_result.get("destination_name") and not slots.get("destination"):
+                    slots["destination"] = route_result.get("destination_name")
+                if route_result.get("route_mode") and not slots.get("travel_mode"):
+                    slots["travel_mode"] = route_result.get("route_mode")
+                if route_result.get("waypoints") and not slots.get("waypoints"):
+                    slots["waypoints"] = route_result.get("waypoints")
+
+                logger.info(
+                    "[NAV] 收到前端完整路线回传，steps=%s distance=%s",
+                    len(route_result.get("steps", []) or []),
+                    route_result.get("distance", ""),
+                )
+                await _broadcast_nav_summary(
+                    agent,
+                    session_id,
+                    route_result,
+                    slots,
+                    intent_type=intent_type,
+                )
+
             # ── 会话结束 ──
             elif event_type == "client_session_end":
                 if agent:
                     await agent.stop()
                     agent = None
                 _pending_nav.pop(session_id, None)
+                _pending_nav_route_broadcast.pop(session_id, None)
                 _session_current_location.pop(session_id, None)
                 from tools.video_tools import reset_visual_state
                 reset_visual_state()
@@ -1689,6 +1357,7 @@ async def single_agent_endpoint(
             except Exception:
                 pass
         _pending_nav.pop(session_id, None)
+        _pending_nav_route_broadcast.pop(session_id, None)
         _session_current_location.pop(session_id, None)
         from tools.video_tools import reset_visual_state
         reset_visual_state()
@@ -1700,6 +1369,7 @@ if __name__ == "__main__":
     _dk = os.getenv("DASHSCOPE_API_KEY", "")
     _wk = os.getenv("AMAP_WEB_KEY", "")
     _ws = os.getenv("AMAP_WEB_SECRET", "")
+    _sh = os.getenv("AMAP_WEB_SERVICE_HOST", "")
     print(
         f"[BOOT] DASHSCOPE_API_KEY: "
         f"{'已设置 (' + _dk[:8] + '...)' if _dk else '⚠ 未设置!'}",
@@ -1715,6 +1385,10 @@ if __name__ == "__main__":
     print(
         f"[BOOT] AMAP_WEB_SECRET:   "
         f"{'已设置 (' + _ws[:8] + '...)' if _ws else '⚠ 未设置!'}",
+    )
+    print(
+        f"[BOOT] AMAP_SERVICE_HOST: "
+        f"{_sh if _sh else '未设置(开发环境可使用 securityJsCode)'}",
     )
 
     uvicorn.run(
