@@ -1,0 +1,158 @@
+# -*- coding: utf-8 -*-
+"""导航分析桥接工具 — 严格两阶段执行。
+
+流程:
+    1. Whisper 转写文本
+    2. 第一模型：意图识别 + 槽位填充，仅输出 JSON
+    3. 第二模型：导航校验，接收 intent + slots JSON
+"""
+import asyncio
+import json
+import traceback
+
+from agentscope import logger
+from agentscope.message import Msg, TextBlock
+from agentscope.tool import ToolResponse
+
+from app.models.intent_schema import IntentResult
+from app.models.nav_result_schema import ErrorResult, NeedSelectionResult, RouteResult
+
+# ── 智能体单例及锁 ──
+_comp_agent = None
+_comp_lock = asyncio.Lock()
+_comp_reply_lock = asyncio.Lock()
+
+_nav_agent = None
+_nav_lock = asyncio.Lock()
+_nav_reply_lock = asyncio.Lock()
+
+
+def _extract_text_content_strict(content) -> str:
+    """从模型返回内容中提取纯文本。"""
+    if isinstance(content, str):
+        text = content.strip()
+        if not text:
+            raise ValueError("模型返回空文本")
+        return text
+
+    if isinstance(content, list):
+        texts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                texts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                texts.append(block)
+        text = "\n".join(t for t in texts if isinstance(t, str)).strip()
+        if not text:
+            raise ValueError("模型返回中未包含 text block")
+        return text
+
+    raise ValueError(f"不支持的模型返回类型: {type(content)}")
+
+
+def _parse_json_dict_strict(text: str) -> dict:
+    """严格解析 JSON 字典：仅接受单个 JSON 对象。"""
+    cleaned = (text or "").strip()
+
+    if cleaned.startswith("```") and cleaned.endswith("```"):
+        lines = cleaned.splitlines()
+        if len(lines) >= 3 and lines[-1].strip() == "```":
+            head = lines[0].strip().lower()
+            if head in ("```", "```json", "```jsonc"):
+                cleaned = "\n".join(lines[1:-1]).strip()
+
+    parsed = json.loads(cleaned)
+    if not isinstance(parsed, dict):
+        raise ValueError("模型输出不是 JSON 对象")
+    return parsed
+
+
+def _validate_intent_result_strict(text: str) -> str:
+    """校验意图识别输出并返回规范化 JSON。"""
+    data = _parse_json_dict_strict(text)
+    slots = data.get("slots")
+    if isinstance(slots, dict):
+        for key in ("waypoints", "sequence"):
+            if slots.get(key) is None:
+                slots[key] = []
+    validated = IntentResult.model_validate(data)
+    return validated.model_dump_json(ensure_ascii=False)
+
+
+def _validate_navigation_result_strict(text: str) -> str:
+    """校验导航校验输出并返回规范化 JSON。"""
+    data = _parse_json_dict_strict(text)
+    status = data.get("status")
+    if status == "need_selection":
+        return NeedSelectionResult.model_validate(data).model_dump_json(ensure_ascii=False)
+    if status in ("ok", "success"):
+        return RouteResult.model_validate(data).model_dump_json(ensure_ascii=False)
+    if status == "error":
+        return ErrorResult.model_validate(data).model_dump_json(ensure_ascii=False)
+    raise ValueError(f"未知导航结果 status: {status}")
+
+
+async def _get_comp_agent():
+    """懒加载意图识别智能体。"""
+    global _comp_agent
+    async with _comp_lock:
+        if _comp_agent is None:
+            logger.info("[COMP-AGENT] 正在创建意图识别智能体...")
+            from app.agents.comprehension_agent import create_comprehension_agent
+            _comp_agent = create_comprehension_agent()
+            logger.info("[COMP-AGENT] 意图识别智能体创建完成")
+    return _comp_agent
+
+
+async def _get_nav_agent():
+    """懒加载导航校验智能体。"""
+    global _nav_agent
+    async with _nav_lock:
+        if _nav_agent is None:
+            logger.info("[NAV-AGENT] 正在创建导航校验智能体...")
+            from app.agents.navigation_agent import create_navigation_agent
+            _nav_agent = create_navigation_agent()
+            logger.info("[NAV-AGENT] 导航校验智能体创建完成")
+    return _nav_agent
+
+
+async def async_trigger(user_text: str) -> str:
+    """异步执行意图分析（第一阶段）。"""
+    logger.info("[NAV-TRIGGER] 开始分析: %s", user_text[:100])
+    agent = await _get_comp_agent()
+    user_msg = Msg(name="user", content=user_text, role="user")
+    async with _comp_reply_lock:
+        reply = await agent.reply(user_msg)
+    result_text = _extract_text_content_strict(reply.content)
+    normalized = _validate_intent_result_strict(result_text)
+    logger.info("[NAV-TRIGGER] 分析结果: %s", normalized[:200])
+    return normalized
+
+
+async def async_run_navigation(navigation_request) -> str:
+    """异步执行导航校验（第二阶段）。"""
+    if isinstance(navigation_request, str):
+        request_text = navigation_request
+    else:
+        request_text = json.dumps(navigation_request, ensure_ascii=False)
+    logger.info("[NAV-TRIGGER] 开始导航校验: %s", request_text[:200])
+    agent = await _get_nav_agent()
+    msg = Msg(name="intent_result", content=request_text, role="user")
+    async with _nav_reply_lock:
+        reply = await agent.reply(msg)
+    result_text = _extract_text_content_strict(reply.content)
+    normalized = _validate_navigation_result_strict(result_text)
+    logger.info("[NAV-TRIGGER] 导航校验结果: %s", normalized[:200])
+    return normalized
+
+
+def trigger_navigation(user_text: str) -> ToolResponse:
+    """同步版本 — 供支持工具调用的模型使用。"""
+    try:
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            result_text = pool.submit(asyncio.run, async_trigger(user_text)).result(timeout=60)
+    except Exception as e:
+        traceback.print_exc()
+        result_text = json.dumps({"status": "error", "message": f"导航分析失败: {e}"}, ensure_ascii=False)
+    return ToolResponse(content=[TextBlock(type="text", text=result_text)], metadata={"type": "navigation_result"})
