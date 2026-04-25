@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """导航分流与 Stage 1/2 管线。"""
+import asyncio
 import re
 import traceback
 from typing import Optional
@@ -24,7 +25,7 @@ from services.nav_utils import (
     _tool_response_to_json,
     _validate_need_selection_result,
 )
-from tools.video_tools import get_current_visual_state
+from tools.video_tools import analyze_visual_for_user_input, get_current_visual_state
 
 from app.services.session_state import (
     build_nav_memory_hint_for_llm,
@@ -45,6 +46,28 @@ def detect_nav_intent(text: str) -> bool:
     if not text or len(text.strip()) < 2:
         return False
     return bool(_NAV_PATTERN.search(text))
+
+
+def _should_request_visual_context(user_text: str) -> bool:
+    text = str(user_text or "").strip()
+    if not text:
+        return False
+    if text.startswith("我选择地点："):
+        return False
+    return True
+
+
+def _merge_visual_context(base_text: str, user_text: str, visual_context: str) -> str:
+    if not str(visual_context or "").strip():
+        return base_text
+    clean_user_text = str(user_text or "").strip()
+    clean_visual = str(visual_context or "").strip()
+    return (
+        f"{base_text}\n"
+        f"[用户当前输入] {clean_user_text}\n"
+        f"[视觉参考] {clean_visual}\n"
+        "仅当视觉参考与用户当前输入直接相关时才在回复中使用，否则忽略。"
+    )
 
 
 async def inject_text_to_agent(agent: Optional[RealtimeAgent], session_id: str, text: str) -> None:
@@ -429,6 +452,10 @@ async def run_nav_pipeline(user_text: str, websocket: WebSocket, session_id: Opt
 
 async def route_text_by_flowchart(user_text: str, websocket: WebSocket, agent: Optional[RealtimeAgent], session_id: str) -> None:
     async with get_session_route_lock(session_id):
+        visual_task = None
+        if _should_request_visual_context(user_text):
+            visual_task = asyncio.create_task(analyze_visual_for_user_input(user_text))
+
         llm_text = user_text
         if detect_nav_intent(user_text):
             memory_hint = await build_nav_memory_hint_for_llm(session_id)
@@ -436,7 +463,9 @@ async def route_text_by_flowchart(user_text: str, websocket: WebSocket, agent: O
                 llm_text = f"{user_text}{memory_hint}"
 
         is_navigation, nav_data, _ = await run_nav_pipeline(llm_text, websocket, session_id=session_id, raw_user_text=user_text)
-        visual_state = await get_current_visual_state()
+        visual_state = await visual_task if visual_task else ""
+        if not visual_state:
+            visual_state = await get_current_visual_state()
 
         if is_navigation and isinstance(nav_data, dict):
             slots = nav_data.get("slots", {})
@@ -473,8 +502,7 @@ async def route_text_by_flowchart(user_text: str, websocket: WebSocket, agent: O
 
         if isinstance(nav_data, dict) and nav_data.get("needs_clarification"):
             ask = nav_data.get("clarification_question") or "请补充导航信息。"
-            if visual_state:
-                ask = f"{ask}\n当前视觉环境：{visual_state}"
+            ask = _merge_visual_context(ask, user_text, visual_state)
             await inject_text_to_agent(agent, session_id, ask)
             return
 
@@ -488,12 +516,9 @@ async def route_text_by_flowchart(user_text: str, websocket: WebSocket, agent: O
                 return
 
             summary = _build_nav_broadcast_text(nav_data, user_text)
-            if visual_state:
-                summary += f"\n当前视觉环境：{visual_state}"
+            summary = _merge_visual_context(summary, user_text, visual_state)
             await inject_text_to_agent(agent, session_id, summary)
             return
 
-        non_nav_text = user_text
-        if visual_state:
-            non_nav_text = f"{user_text}\n[视觉状态] {visual_state}"
+        non_nav_text = _merge_visual_context(user_text, user_text, visual_state)
         await inject_text_to_agent(agent, session_id, non_nav_text)

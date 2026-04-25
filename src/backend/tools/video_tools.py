@@ -27,6 +27,8 @@ _last_analysis_time: float = 0.0
 # 当前视觉状态（供 RealtimeAgent 使用）
 _current_visual_state: str = ""
 _visual_state_lock = asyncio.Lock()
+_latest_frame_base64: str = ""
+_latest_frame_lock = asyncio.Lock()
 
 
 def _get_vl_client() -> OpenAI:
@@ -150,6 +152,11 @@ async def process_video_frame(jpeg_base64: str) -> Optional[str]:
     """
     global _current_visual_state
 
+    global _latest_frame_base64
+
+    async with _latest_frame_lock:
+        _latest_frame_base64 = jpeg_base64
+
     jpeg_bytes = base64.b64decode(jpeg_base64)
 
     # 抽帧节流：仅每隔 VIDEO_FRAME_INTERVAL 秒允许一次分析尝试
@@ -172,6 +179,61 @@ async def process_video_frame(jpeg_base64: str) -> Optional[str]:
     return result
 
 
+def _build_visual_query_prompt(user_text: str) -> str:
+    clean_text = str(user_text or "").strip()
+    visual_question_keywords = (
+        "视频",
+        "画面",
+        "图片",
+        "图像",
+        "镜头",
+        "内容",
+        "看出来",
+        "看到",
+        "看见",
+    )
+    asks_visual_content = any(keyword in clean_text for keyword in visual_question_keywords)
+
+    if asks_visual_content:
+        return (
+            "请直接回答用户关于当前视频画面的提问。\n"
+            f"用户问题：{clean_text}\n"
+            "先概括画面主体，再补充人物、场景、动作或显著物体。"
+            "只依据画面中能直接看到的事实，不要推测。"
+            "只有在当前画面确实无法判断时，才回答“无法从当前画面判断”。"
+            "请用中文回答，控制在60字以内。"
+        )
+    return (
+        "请根据用户当前问题分析这张视频帧。\n"
+        f"用户当前输入：{clean_text}\n"
+        "请只描述画面中与该输入直接相关的可见事实。"
+        "如果没有直接相关信息，请明确回答“无与当前问题直接相关的视觉信息”。"
+        "不要推测画面外的信息，不要给驾驶建议。"
+        "请用中文回答，控制在60字以内。"
+    )
+
+
+async def analyze_visual_for_user_input(user_text: str) -> str:
+    """根据用户当前输入，对最近一帧执行一次按需视觉分析。"""
+    global _current_visual_state
+
+    if not str(user_text or "").strip():
+        return ""
+
+    async with _latest_frame_lock:
+        latest_frame = _latest_frame_base64
+
+    if not latest_frame:
+        return ""
+
+    result = await analyze_frame(latest_frame, prompt=_build_visual_query_prompt(user_text))
+    if result:
+        async with _visual_state_lock:
+            _current_visual_state = result
+        return result
+    return ""
+
+
 async def get_current_visual_state() -> str:
     """获取当前视觉状态描述（供 RealtimeAgent 使用）。
 
@@ -184,7 +246,8 @@ async def get_current_visual_state() -> str:
 
 def reset_visual_state():
     """重置视觉状态（断开连接时调用）。"""
-    global _last_histogram, _last_analysis_time, _current_visual_state
+    global _last_histogram, _last_analysis_time, _current_visual_state, _latest_frame_base64
     _last_histogram = None
     _last_analysis_time = 0.0
     _current_visual_state = ""
+    _latest_frame_base64 = ""

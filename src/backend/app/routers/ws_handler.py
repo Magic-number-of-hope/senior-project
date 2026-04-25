@@ -33,7 +33,6 @@ async def handle_video_frame(jpeg_base64: str, websocket: WebSocket, agent, sess
         result = await process_video_frame(jpeg_base64)
         if result:
             await websocket.send_json({"type": "visual_analysis_result", "description": result})
-            await inject_text_to_agent(agent, session_id, f"[视觉信息] {result}")
     except Exception as exc:
         logger.error("[VIDEO] 视频帧处理失败: %s", exc)
 
@@ -108,8 +107,7 @@ async def single_agent_endpoint(websocket: WebSocket, user_id: str, session_id: 
                         transcript = await whisper_transcribe(pcm)
                         if transcript:
                             await ws.send_json({"type": "whisper_transcription", "transcript": transcript})
-                            if detect_nav_intent(transcript):
-                                await route_text_by_flowchart(transcript, ws, agent, session_id)
+                            await route_text_by_flowchart(transcript, ws, agent, session_id)
 
                     asyncio.create_task(_whisper_and_analyze(pcm_bytes, websocket))
                 else:
