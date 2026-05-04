@@ -103,13 +103,12 @@ async def single_agent_endpoint(websocket: WebSocket, user_id: str, session_id: 
                     pcm_bytes = bytes(audio_buffer)
                     audio_buffer.clear()
 
-                    async def _whisper_and_analyze(pcm, ws):
+                    async def _whisper_and_forward(pcm, ws):
                         transcript = await whisper_transcribe(pcm)
                         if transcript:
                             await ws.send_json({"type": "whisper_transcription", "transcript": transcript})
-                            await route_text_by_flowchart(transcript, ws, agent, session_id)
 
-                    asyncio.create_task(_whisper_and_analyze(pcm_bytes, websocket))
+                    asyncio.create_task(_whisper_and_forward(pcm_bytes, websocket))
                 else:
                     audio_buffer.clear()
 
@@ -221,6 +220,9 @@ async def single_agent_endpoint(websocket: WebSocket, user_id: str, session_id: 
                 if agent:
                     await agent.stop()
                     agent = None
+                from tools.analysis_tools import cleanup_comp_agent_session
+
+                cleanup_comp_agent_session(session_id)
                 cleanup_session(session_id)
                 from tools.video_tools import reset_visual_state
 
@@ -241,6 +243,9 @@ async def single_agent_endpoint(websocket: WebSocket, user_id: str, session_id: 
                 await agent.stop()
             except Exception:
                 pass
+        from tools.analysis_tools import cleanup_comp_agent_session
+
+        cleanup_comp_agent_session(session_id)
         cleanup_session(session_id)
         from tools.video_tools import reset_visual_state
 

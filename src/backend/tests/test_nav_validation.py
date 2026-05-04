@@ -11,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from services.nav_routing import _normalize_mode, _ensure_map_fields, _try_direct_route_planning
 from services.nav_utils import _get_missing_slots, _parse_nav_result
+from app.services.session_state import hydrate_nav_slots_from_context, session_current_location, save_nav_context
+from app.services.nav_pipeline import apply_session_memory_to_nav_data
 from tools.analysis_tools import _validate_navigation_result_strict
 from run_server import (
     _normalize_travel_mode_value,
@@ -202,6 +204,88 @@ def test_step3b_mode_change_continuity():
     )
 
     return ok_preserve and ok_normalized
+
+
+async def test_step3c_current_location_placeholder_hydration():
+    print("\n" + "="*60)
+    print("STEP 3C: 当前位置占位词补全经纬度")
+    print("="*60)
+
+    session_id = "test-current-location-placeholder"
+    session_current_location[session_id] = {
+        "name": "武汉理工大学马房山校区东院",
+        "location": "114.353823,30.518657",
+        "source": "browser",
+    }
+
+    try:
+        await save_nav_context(session_id, {})
+        hydrated = await hydrate_nav_slots_from_context(
+            session_id,
+            "带我去光谷广场",
+            "basic_navigation",
+            {
+                "origin": "当前位置",
+                "destination": "光谷广场",
+                "travel_mode": "walking",
+            },
+        )
+        ok = (
+            hydrated.get("origin") == "武汉理工大学马房山校区东院"
+            and hydrated.get("origin_location") == "114.353823,30.518657"
+            and hydrated.get("destination") == "光谷广场"
+        )
+        print(f"  {'✅' if ok else '❌'} 当前位置占位词补全结果: {hydrated}")
+        return ok
+    finally:
+        session_current_location.pop(session_id, None)
+
+
+async def test_step3d_session_memory_clears_clarification():
+    print("\n" + "="*60)
+    print("STEP 3D: 会话记忆补全后取消追问")
+    print("="*60)
+
+    session_id = "test-session-memory-follow-up"
+    try:
+        await save_nav_context(session_id, {
+            "origin": "武汉理工大学(余家头校区)",
+            "origin_location": "114.372452,30.634331",
+            "destination": "武昌火车站",
+            "destination_location": "114.31534,30.528149",
+            "travel_mode": "driving",
+        })
+        nav_data = {
+            "is_navigation": True,
+            "intent_type": "basic_navigation",
+            "slots": {
+                "origin": None,
+                "destination": None,
+                "waypoints": [],
+                "travel_mode": "bicycling",
+                "time_constraint": None,
+                "preference": None,
+                "poi_type": None,
+                "poi_constraint": None,
+                "sequence": [],
+            },
+            "confidence": 0.8,
+            "needs_clarification": True,
+            "clarification_question": "请问您的起点和终点是哪里？",
+            "raw_text": "骑车怎么走",
+        }
+        hydrated = await apply_session_memory_to_nav_data(session_id, "骑车怎么走", nav_data)
+        ok = (
+            hydrated.get("needs_clarification") is False
+            and hydrated.get("clarification_question") is None
+            and hydrated.get("slots", {}).get("origin") == "武汉理工大学(余家头校区)"
+            and hydrated.get("slots", {}).get("destination") == "武昌火车站"
+            and hydrated.get("slots", {}).get("travel_mode") == "bicycling"
+        )
+        print(f"  {'✅' if ok else '❌'} 会话记忆续问补全结果: {hydrated}")
+        return ok
+    finally:
+        await save_nav_context(session_id, {})
 
 
 # ──────────────────────────────────────────────
@@ -446,6 +530,8 @@ async def main():
     results["STEP2 途径点模式守卫"] = test_step2_waypoint_mode_guard()
     results["STEP3 缺失槽位检测"] = test_step3_missing_slots()
     results["STEP3B 持续对话模式切换"] = test_step3b_mode_change_continuity()
+    results["STEP3C 当前位置占位词补全"] = await test_step3c_current_location_placeholder_hydration()
+    results["STEP3D 会话记忆取消追问"] = await test_step3d_session_memory_clears_clarification()
     results["STEP4 JSON严格解析"] = test_step4_parse_nav_result()
     results["STEP4B life_service 归一化"] = test_step4b_life_service_result_normalize()
     results["STEP5 ensure_map_fields"] = await test_step5_ensure_map_fields()

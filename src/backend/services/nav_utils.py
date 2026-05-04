@@ -10,6 +10,9 @@ from models.nav_result_schema import NeedSelectionResult
 _CURRENT_LOCATION_HINT_PATTERN = re.compile(
     r"我现在|当前位置|附近|周边|离我|就近|最近|这里|这儿",
 )
+_CURRENT_LOCATION_PLACEHOLDER_PATTERN = re.compile(
+    r"^(我现在的位置|我现在|当前位置|当前所在位置|这里|这儿|我这里|我这儿)$",
+)
 _CONTEXT_CONTINUATION_PATTERN = re.compile(
     r"再去|然后去|接着去|继续去|下一站|下一步",
 )
@@ -36,7 +39,11 @@ def _should_use_current_location(
     slots: dict,
 ) -> bool:
     """判断在起点缺失时，是否优先采用当前位置补全。"""
-    if slots.get("origin"):
+    origin = str(slots.get("origin") or "").strip()
+    if slots.get("origin_location"):
+        return False
+
+    if origin and not _CURRENT_LOCATION_PLACEHOLDER_PATTERN.fullmatch(origin):
         return False
 
     if intent_type == "life_service":

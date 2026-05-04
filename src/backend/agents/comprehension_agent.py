@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """理解分析智能体 — 意图识别 + 槽位填充 + 判断是否导航 + 调用导航智能体"""
 import asyncio
-from typing import Any
+from typing import Any, Optional
 
 from agentscope import logger
 from agentscope.agent import ReActAgent
 from agentscope.formatter import DashScopeChatFormatter
+from agentscope.memory import InMemoryMemory
 from agentscope.message import Msg, TextBlock
 from agentscope.model import DashScopeChatModel
 from agentscope.tool import Toolkit, ToolResponse
@@ -37,7 +38,7 @@ def get_user_profile(user_id: str = "default") -> ToolResponse:
     return ToolResponse(content=[TextBlock(type="text", text=profile_json)])
 
 
-def create_comprehension_agent() -> ReActAgent:
+def create_comprehension_agent(memory: Optional[InMemoryMemory] = None) -> ReActAgent:
     """创建意图识别和槽位填充智能体实例。
 
     该智能体负责：
@@ -76,5 +77,6 @@ def create_comprehension_agent() -> ReActAgent:
         model=model,
         formatter=formatter,
         toolkit=toolkit,
+        memory=memory,
         max_iters=10,
     )

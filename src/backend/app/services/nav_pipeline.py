@@ -362,28 +362,50 @@ async def run_stage2_with_slots(slots: dict, intent_type: str, websocket: WebSoc
     )
 
 
+async def apply_session_memory_to_nav_data(session_id: Optional[str], source_text: str, nav_data: dict) -> dict:
+    if not session_id or not isinstance(nav_data, dict) or nav_data.get("is_navigation") is False:
+        return nav_data
+
+    slots = nav_data.get("slots", {})
+    if not isinstance(slots, dict):
+        slots = {}
+
+    intent_type = nav_data.get("intent_type", "")
+    slots = await hydrate_nav_slots_from_context(session_id, source_text, intent_type, slots)
+    nav_data["slots"] = slots
+
+    if nav_data.get("needs_clarification"):
+        required_missing = _get_missing_slots(slots, intent_type)
+        if not required_missing:
+            nav_data["needs_clarification"] = False
+            nav_data["clarification_question"] = None
+            logger.info("[NAV-MEM] 会话记忆补全后取消追问 session=%s", session_id)
+
+    return nav_data
+
+
 async def run_nav_pipeline(user_text: str, websocket: WebSocket, session_id: Optional[str] = None, raw_user_text: Optional[str] = None) -> tuple[bool, Optional[dict], str]:
     try:
         source_text = raw_user_text or user_text
         await send_nav_status(websocket, "processing", "正在分析导航意图...")
         from tools.analysis_tools import _async_run_navigation, _async_trigger
 
-        result_text = await _async_trigger(user_text)
+        result_text = await _async_trigger(user_text, session_id=session_id or "")
         nav_data = _parse_nav_result(result_text)
         nav_data = IntentResult.model_validate(nav_data).model_dump(mode="python")
 
         if nav_data.get("is_navigation") is False:
             await send_nav_status(websocket, "done", "非导航需求")
             return False, nav_data, result_text
-        if nav_data.get("needs_clarification"):
-            await send_nav_status(websocket, "done", nav_data.get("clarification_question", "需要补充导航信息"))
-            return True, nav_data, result_text
+
+        nav_data = await apply_session_memory_to_nav_data(session_id, source_text, nav_data)
 
         slots = nav_data.get("slots", {})
         intent_type = nav_data.get("intent_type", "")
-        if session_id:
-            slots = await hydrate_nav_slots_from_context(session_id, source_text, intent_type, slots)
-            nav_data["slots"] = slots
+
+        if nav_data.get("needs_clarification"):
+            await send_nav_status(websocket, "done", nav_data.get("clarification_question", "需要补充导航信息"))
+            return True, nav_data, result_text
 
         if "intent_type" in nav_data:
             await websocket.send_json({
@@ -404,8 +426,12 @@ async def run_nav_pipeline(user_text: str, websocket: WebSocket, session_id: Opt
 
         slots = await ensure_life_service_origin_location(slots, intent_type)
         nav_data["slots"] = slots
-        nav_result_text = await _async_run_navigation({"intent_type": intent_type, "slots": slots})
-        nav_result = _parse_nav_result(nav_result_text)
+        fast_nav_result = await _try_fast_nav_without_llm(slots)
+        if isinstance(fast_nav_result, dict):
+            nav_result = fast_nav_result
+        else:
+            nav_result_text = await _async_run_navigation({"intent_type": intent_type, "slots": slots})
+            nav_result = _parse_nav_result(nav_result_text)
         nav_data["navigation_result"] = nav_result
 
         status = nav_result.get("status", "")

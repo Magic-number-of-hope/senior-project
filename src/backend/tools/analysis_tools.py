@@ -12,6 +12,7 @@ import json
 import traceback
 
 from agentscope import logger
+from agentscope.memory import InMemoryMemory
 from agentscope.tool import ToolResponse
 from agentscope.message import Msg, TextBlock
 
@@ -21,8 +22,10 @@ from models.nav_result_schema import NeedSelectionResult, RouteResult, ErrorResu
 
 # 全局意图识别智能体单例
 _comp_agent = None
+_comp_session_agents = {}
 _comp_lock = asyncio.Lock()
 _comp_reply_lock = asyncio.Lock()
+_comp_session_reply_locks = {}
 
 _nav_agent = None
 _nav_lock = asyncio.Lock()
@@ -179,16 +182,48 @@ def _validate_navigation_result_strict(text: str) -> str:
     raise ValueError(f"未知导航结果 status: {status}")
 
 
-async def _get_comp_agent():
-    """懒加载意图识别智能体"""
+def _get_comp_reply_lock(session_id: str = "") -> asyncio.Lock:
+    if not session_id:
+        return _comp_reply_lock
+
+    lock = _comp_session_reply_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _comp_session_reply_locks[session_id] = lock
+    return lock
+
+
+async def _get_comp_agent(session_id: str = ""):
+    """懒加载意图识别智能体。带 session_id 时启用会话级 memory。"""
     global _comp_agent
     async with _comp_lock:
+        if session_id:
+            agent = _comp_session_agents.get(session_id)
+            if agent is None:
+                logger.info("[COMP-AGENT] 正在创建会话级意图识别智能体 session=%s...", session_id)
+                from agents.comprehension_agent import create_comprehension_agent
+
+                agent = create_comprehension_agent(memory=InMemoryMemory())
+                _comp_session_agents[session_id] = agent
+                _comp_session_reply_locks[session_id] = asyncio.Lock()
+                logger.info("[COMP-AGENT] 会话级意图识别智能体创建完成 session=%s", session_id)
+            return agent
+
         if _comp_agent is None:
             logger.info("[COMP-AGENT] 正在创建意图识别智能体...")
             from agents.comprehension_agent import create_comprehension_agent
+
             _comp_agent = create_comprehension_agent()
             logger.info("[COMP-AGENT] 意图识别智能体创建完成")
     return _comp_agent
+
+
+def cleanup_comp_agent_session(session_id: str) -> None:
+    if not session_id:
+        return
+
+    _comp_session_agents.pop(session_id, None)
+    _comp_session_reply_locks.pop(session_id, None)
 
 
 async def _get_nav_agent():
@@ -203,7 +238,7 @@ async def _get_nav_agent():
     return _nav_agent
 
 
-async def _async_trigger(user_text: str) -> str:
+async def _async_trigger(user_text: str, session_id: str = "") -> str:
     """异步执行意图分析 — 第一阶段，仅返回 intent+slots JSON。
 
     Whisper 转写完成后调用此函数，将文本交给意图识别智能体。
@@ -217,7 +252,7 @@ async def _async_trigger(user_text: str) -> str:
     """
     logger.info("[NAV-TRIGGER] 开始分析: %s", user_text[:100])
 
-    agent = await _get_comp_agent()
+    agent = await _get_comp_agent(session_id=session_id)
 
     user_msg = Msg(
         name="user",
@@ -227,7 +262,7 @@ async def _async_trigger(user_text: str) -> str:
 
     logger.info("[NAV-TRIGGER] 调用意图识别智能体...")
     # 同一阶段串行调用，避免一个 agent 实例被并发 reply 导致上下文交错。
-    async with _comp_reply_lock:
+    async with _get_comp_reply_lock(session_id):
         reply = await agent.reply(user_msg)
     logger.info("[NAV-TRIGGER] 意图识别智能体回复完成")
 
