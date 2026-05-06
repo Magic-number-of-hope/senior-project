@@ -13,6 +13,9 @@ _CURRENT_LOCATION_HINT_PATTERN = re.compile(
 _CURRENT_LOCATION_PLACEHOLDER_PATTERN = re.compile(
     r"^(我现在的位置|我现在|当前位置|当前所在位置|这里|这儿|我这里|我这儿)$",
 )
+_ROUTE_QUERY_HINT_PATTERN = re.compile(
+    r"怎么走|怎么去|如何走|如何去|导航|路线",
+)
 _CONTEXT_CONTINUATION_PATTERN = re.compile(
     r"再去|然后去|接着去|继续去|下一站|下一步",
 )
@@ -57,6 +60,9 @@ def _should_use_current_location(
         return False
 
     if _CURRENT_LOCATION_HINT_PATTERN.search(text):
+        return True
+
+    if slots.get("travel_mode") and _ROUTE_QUERY_HINT_PATTERN.search(text):
         return True
 
     return bool(slots.get("destination") or slots.get("poi_type"))
@@ -120,6 +126,8 @@ def _build_nav_broadcast_text(nav_data: Optional[dict], user_text: str) -> str:
     dest_name = nav_result.get("destination_name", dest)
     distance = nav_result.get("distance", "")
     taxi_cost = nav_result.get("taxi_cost", "")
+    transit_cost = nav_result.get("transit_cost", "")
+    route_mode = str(nav_result.get("route_mode") or slots.get("travel_mode") or "")
 
     steps = nav_result.get("steps", [])
     first_steps = steps[:3]
@@ -132,7 +140,11 @@ def _build_nav_broadcast_text(nav_data: Optional[dict], user_text: str) -> str:
     if distance:
         km = round(int(distance) / 1000, 1) if distance.isdigit() else distance
         parts.append(f"全程约{km}公里，")
-    if taxi_cost:
+    if route_mode == "transit" and transit_cost:
+        parts.append(f"预计票价{transit_cost}元，")
+    elif route_mode == "transit" and taxi_cost:
+        parts.append(f"预计票价{taxi_cost}元，")
+    elif taxi_cost:
         parts.append(f"预计打车{taxi_cost}元，")
     if waypoints:
         parts.append(f"途经{'、'.join(waypoints)}，")

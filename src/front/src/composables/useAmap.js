@@ -422,7 +422,8 @@ export function useAmap (wsSend, isWsConnected) {
         summary: '公交方案' + (idx + 1),
         distance: String(plan && plan.distance != null ? plan.distance : ''),
         duration: String(plan && plan.time != null ? plan.time : ''),
-        taxi_cost: String(plan && plan.cost != null ? plan.cost : (result && result.taxi_cost != null ? result.taxi_cost : (baseRoute && baseRoute.taxi_cost) || '')),
+        taxi_cost: '',
+        transit_cost: String(plan && plan.cost != null ? plan.cost : (result && result.transit_cost != null ? result.transit_cost : (baseRoute && baseRoute.transit_cost) || '')),
         transfer_count: Math.max(transitLegCount - 1, 0),
         steps: steps,
         polyline: routePolyline,
@@ -443,7 +444,8 @@ export function useAmap (wsSend, isWsConnected) {
       routes: options,
       distance: best.distance,
       duration: best.duration,
-      taxi_cost: best.taxi_cost,
+      taxi_cost: '',
+      transit_cost: best.transit_cost,
       transfer_count: best.transfer_count,
       steps: best.steps,
       polyline: best.polyline,
@@ -773,6 +775,7 @@ export function useAmap (wsSend, isWsConnected) {
       distance: opt.distance || route.distance || '',
       duration: opt.duration || route.duration || '',
       taxi_cost: opt.taxi_cost || route.taxi_cost || '',
+      transit_cost: opt.transit_cost || route.transit_cost || '',
       transfer_count: opt.transfer_count,
       steps: Array.isArray(opt.steps) ? opt.steps : (Array.isArray(route.steps) ? route.steps : []),
       polyline: opt.polyline || '',
@@ -799,6 +802,7 @@ export function useAmap (wsSend, isWsConnected) {
       distance: route.distance || '',
       duration: route.duration || '',
       taxi_cost: route.taxi_cost || '',
+      transit_cost: route.transit_cost || '',
       steps: Array.isArray(route.steps) ? route.steps : [],
       polyline: route.polyline || '',
       segments: Array.isArray(route.segments) ? route.segments : []
@@ -1042,6 +1046,7 @@ export function useAmap (wsSend, isWsConnected) {
       distance: active.distance || base.distance || '',
       duration: active.duration || base.duration || '',
       taxi_cost: active.taxi_cost || base.taxi_cost || '',
+      transit_cost: active.transit_cost || base.transit_cost || '',
       steps: mergedSteps,
       route_index: active.route_index != null ? active.route_index : idx
     }

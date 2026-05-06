@@ -385,12 +385,17 @@ export default {
           break
 
         case 'nav_route_result': {
-          const jsPlannedRoute = await planRouteByJsApiOnce(data.route_result || {})
+          const backendRoute = data.route_result || {}
+          const jsPlannedRoute = await planRouteByJsApiOnce(backendRoute)
           const routeOpts = getRouteOptions(jsPlannedRoute)
           const selIdx = selectedRouteIndex.value || 0
           intentPanelRef.value?.renderRouteResult(jsPlannedRoute, routeOpts, selIdx)
-          await showRouteOnMap(jsPlannedRoute, mapContainerRef.value?.routeOptionsEl)
           sendPlannedRouteToBackend(jsPlannedRoute)
+          try {
+            await showRouteOnMap(jsPlannedRoute, mapContainerRef.value?.routeOptionsEl)
+          } catch (err) {
+            console.warn('[MAP] showRouteOnMap failed:', err)
+          }
           navStatusRef.value?.updateNavStatus('done', '路线规划完成')
           break
         }

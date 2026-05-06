@@ -40,6 +40,7 @@ class RouteInfo(BaseModel):
     distance: Optional[str] = Field(None, description="总距离(米)")
     duration: Optional[str] = Field(None, description="总耗时(秒)")
     taxi_cost: Optional[str] = Field(None, description="打车费(元)")
+    transit_cost: Optional[str] = Field(None, description="公交票价(元)")
     steps: List[RouteStep] = Field(default_factory=list)
     polyline: Optional[str] = Field(None, description="路线坐标串")
 
@@ -114,6 +115,7 @@ class RouteResult(BaseModel):
     distance: Optional[str] = None
     duration: Optional[str] = None
     taxi_cost: Optional[str] = None
+    transit_cost: Optional[str] = None
     steps: List[RouteStep] = Field(default_factory=list)
     polyline: Optional[str] = None
 

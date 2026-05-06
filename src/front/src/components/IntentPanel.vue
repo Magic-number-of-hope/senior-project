@@ -37,7 +37,7 @@
           距离: {{ routeDistanceText }}
           <template v-if="routeDurationText"> | 预计: {{ routeDurationText }}</template>
         </p>
-        <p v-if="routeTaxiCost">预计打车费: ¥{{ routeTaxiCost }}</p>
+        <p v-if="routeCostText">{{ routeCostText }}</p>
         <p v-if="routeOptsCount > 1">可选路线: {{ routeOptsCount }} 条（可在地图下方切换）</p>
         <details v-if="routeSteps.length > 0">
           <summary>详细路线 ({{ routeSteps.length }} 步)</summary>
@@ -209,6 +209,13 @@ const routeOptionsArr = ref([])
 const routeSelIdx = ref(0)
 let lastRouteRenderKey = ''
 
+function clearRouteState () {
+  routeResult.value = null
+  routeOptionsArr.value = []
+  routeSelIdx.value = 0
+  lastRouteRenderKey = ''
+}
+
 const activeRouteOption = computed(() =>
   routeOptionsArr.value[routeSelIdx.value] || routeOptionsArr.value[0] || {})
 
@@ -223,6 +230,19 @@ const routeDuration = computed(() =>
   activeRouteOption.value.duration || routeResult.value?.duration || '')
 const routeTaxiCost = computed(() =>
   activeRouteOption.value.taxi_cost || routeResult.value?.taxi_cost || '')
+const routeTransitCost = computed(() =>
+  activeRouteOption.value.transit_cost || routeResult.value?.transit_cost || '')
+const routeMode = computed(() =>
+  routeResult.value?.route_mode || routeResult.value?.mode || '')
+const routeCostText = computed(() => {
+  if (routeMode.value === 'transit' && routeTransitCost.value) {
+    return '预计票价: ¥' + routeTransitCost.value
+  }
+  if (routeTaxiCost.value) {
+    return '预计打车费: ¥' + routeTaxiCost.value
+  }
+  return ''
+})
 const routeOptsCount = computed(() => routeOptionsArr.value.length)
 const routeWaypointsText = computed(() => {
   const wp = routeResult.value?.waypoints
@@ -252,11 +272,12 @@ function renderRouteResult (route, routeOptions, selectedIdx) {
   const displayDistance = activeOpt.distance || route.distance || ''
   const displayDuration = activeOpt.duration || route.duration || ''
   const displayTaxiCost = activeOpt.taxi_cost || route.taxi_cost || ''
+  const displayTransitCost = activeOpt.transit_cost || route.transit_cost || ''
 
   // 去重 key —— 同一路线不重复渲染
   const routeKey = [
     route.origin_name || '', route.destination_name || '',
-    displayDistance, displayDuration, displayTaxiCost,
+    displayDistance, displayDuration, displayTaxiCost, displayTransitCost,
     Array.isArray(displaySteps) ? displaySteps.length : 0,
     opts.length, idx,
     route.polyline ? route.polyline.length : 0
@@ -285,6 +306,7 @@ const slotForm = reactive({})
 
 function renderMissingSlots (missing, currentSlots) {
   if (!missing || missing.length === 0) return
+  clearRouteState()
   // 重置表单
   Object.keys(slotForm).forEach(k => delete slotForm[k])
   if (currentSlots) {
@@ -331,6 +353,7 @@ let poiFinalCandidates = []
 let poiClearTimer = null
 
 function renderPOICandidates (candidates, originCandidates, destinationCandidates) {
+  clearRouteState()
   if (poiClearTimer) {
     clearTimeout(poiClearTimer)
     poiClearTimer = null
