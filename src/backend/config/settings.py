@@ -51,6 +51,13 @@ CHAT_MODEL_NAME = os.getenv("CHAT_MODEL_NAME", "qwen-max")
 COMPREHENSION_MODEL_NAME = os.getenv(
     "COMPREHENSION_MODEL_NAME", "qwen3-max",
 )
+
+# ── 评估专用：基准对照模型（未微调，用于消融实验方法1-4）──
+EVAL_BASE_MODEL_URL = os.getenv(
+    "EVAL_BASE_MODEL_URL",
+    "https://u331864-82ca-f2dc7f04.westb.seetacloud.com:8443/v1",
+)
+EVAL_BASE_MODEL_NAME = os.getenv("EVAL_BASE_MODEL_NAME", "qwen3-local")
 REALTIME_MODEL_NAME = os.getenv(
     "REALTIME_MODEL_NAME", "qwen3-omni-flash-realtime",
 )
